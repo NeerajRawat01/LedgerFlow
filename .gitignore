@@ -1,0 +1,54 @@
+# ============================================================
+# Dependencies & build artifacts
+# ============================================================
+node_modules/
+.next/
+out/
+build/
+dist/
+*.tsbuildinfo
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+.coverage
+htmlcov/
+
+# ============================================================
+# Environment & secrets — never commit real values
+# ============================================================
+.env
+.env.*
+!.env.example
+
+# ============================================================
+# Logs
+# ============================================================
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# ============================================================
+# Editor & OS
+# ============================================================
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# ============================================================
+# Runtime storage contents (directories are created at runtime)
+# ============================================================
+storage/runs/*
+storage/issues/*
+storage/agent_logs/*
+output/*
+# local (non-Docker) backend runtime output, e.g. `uvicorn` from backend/
+backend/storage/
+backend/output/

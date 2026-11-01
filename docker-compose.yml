@@ -1,0 +1,124 @@
+# LedgerFlow — Phase 1 infrastructure
+#
+# Three independent services:
+#   frontend  -> http://localhost:3000  (Next.js)
+#   backend   -> http://localhost:8000  (FastAPI)
+#   db        -> localhost:5432         (PostgreSQL, intentionally unused)
+#
+# The backend has NO dependency on db: no connection string, no depends_on.
+# The application works with `docker compose stop db`.
+
+name: ledgerflow
+
+services:
+  frontend:
+    build:
+      context: ./frontend
+      args:
+        NEXT_PUBLIC_API_URL: "http://localhost:${BACKEND_PORT:-8000}"
+    image: ledgerflow-frontend
+    container_name: ledgerflow-frontend
+    ports:
+      - "${FRONTEND_PORT:-3000}:3000"
+    environment:
+      NODE_ENV: production
+      NEXT_PUBLIC_API_URL: "http://localhost:${BACKEND_PORT:-8000}"
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "fetch('http://127.0.0.1:3000').then((r) => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))",
+        ]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    networks:
+      - ledgerflow
+    restart: unless-stopped
+
+  backend:
+    build:
+      context: ./backend
+    image: ledgerflow-backend
+    container_name: ledgerflow-backend
+    ports:
+      - "${BACKEND_PORT:-8000}:8000"
+    environment:
+      APP_ENV: ${APP_ENV:-development}
+      SERVICE_NAME: ledgerflow-backend
+      APP_VERSION: "0.1.0"
+      CORS_ORIGINS: "http://localhost:${FRONTEND_PORT:-3000},http://127.0.0.1:${FRONTEND_PORT:-3000}"
+      # Filesystem storage (no database configuration exists here by design).
+      DATA_DIR: /app/data
+      STORAGE_DIR: /app/storage
+      OUTPUT_DIR: /app/output
+      # LLM (optional): without a key the agent returns typed
+      # llm_not_configured. Pick a provider with LLM_PROVIDER (gemini|groq)
+      # and supply a key via LLM_API_KEY (or the provider-specific key).
+      LLM_PROVIDER: ${LLM_PROVIDER:-}
+      LLM_API_KEY: ${LLM_API_KEY:-}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      GROQ_API_KEY: ${GROQ_API_KEY:-}
+      LLM_MODEL: ${LLM_MODEL:-}
+      LLM_TEMPERATURE: ${LLM_TEMPERATURE:-0}
+      # MCP: this app hosts the MCP server at /mcp and its agent connects
+      # back to it over loopback inside the container.
+      MCP_SERVER_URL: ${MCP_SERVER_URL:-http://127.0.0.1:8000/mcp}
+      MCP_TIMEOUT_SECONDS: ${MCP_TIMEOUT_SECONDS:-30}
+      AGENT_MAX_TOOL_CALLS: ${AGENT_MAX_TOOL_CALLS:-25}
+      AGENT_MAX_GRAPH_STEPS: ${AGENT_MAX_GRAPH_STEPS:-50}
+    volumes:
+      # Immutable source inputs
+      - ./data:/app/data:ro
+      # Writable persistence (runs, issues, agent logs) and report output
+      - ./storage:/app/storage
+      - ./output:/app/output
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/health', timeout=3)",
+        ]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    networks:
+      - ledgerflow
+    restart: unless-stopped
+    # NOTE: intentionally no `depends_on: db` and no POSTGRES_* variables.
+
+  db:
+    # Official PostgreSQL image. Present as infrastructure for future use only;
+    # nothing in the application connects to it during Phase 1.
+    image: postgres:16-alpine
+    container_name: ledgerflow-db
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-ledgerflow}
+      POSTGRES_USER: ${POSTGRES_USER:-ledgerflow}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change_me}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    networks:
+      - ledgerflow
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+
+networks:
+  ledgerflow:
+    driver: bridge

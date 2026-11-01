@@ -1,0 +1,11 @@
+# Ignore everything in Docker build contexts at the repository root.
+# (Service-specific build contexts are frontend/ and backend/, each with
+# its own .dockerignore; this file guards accidental root-level builds.)
+**/node_modules
+**/.next
+**/__pycache__
+**/.venv
+**/.git
+**/*.log
+storage
+output
