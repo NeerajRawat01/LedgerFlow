@@ -75,15 +75,23 @@ Independent verification of every control figure (a second, self-contained
 backend/.venv/bin/python scripts/verify_independent.py
 ```
 
+> **Current gap:** after commit `28f3b43` rebuilt India's P&L from the monthly
+> rows, `verify_independent.py` still recomputes India from the full-year trial
+> balance, so it no longer agrees with the engine. The balance-sheet identity it
+> checks still holds. See `VALIDATION.md` §3.
+
 ## Technology stack
 
 | Layer     | Technology |
 |-----------|------------|
 | Frontend  | Next.js (App Router), TypeScript, Tailwind CSS, shadcn/ui, Lucide React |
 | Backend   | Python 3.11+, FastAPI, Pydantic, Uvicorn |
+| Accounting engine | Python `Decimal` (no floats) — deterministic, no LLM on the calculation path |
+| AI agents | LangGraph (`StateGraph`) + LangChain Core; one shared agent with two modes (Consolidation Agent, AI Copilot) |
+| MCP       | Model Context Protocol — `mcp` SDK server + client behind a permissioned tool gateway |
+| LLM providers | LangChain Google Generative AI (Gemini) and Groq, selectable via `LLM_PROVIDER` |
 | Database  | PostgreSQL (official Docker image) — infrastructure only, currently unused |
 | Storage   | Filesystem (`data/`, `storage/`, `output/`) |
-| Future AI | LangChain, LangGraph, MCP, Gemini API, Pandas, Python `Decimal` (later phases) |
 | Infra     | Docker, Docker Compose |
 
 ## High-level architecture

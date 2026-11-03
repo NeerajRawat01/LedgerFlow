@@ -1,304 +1,189 @@
 # Validation
 
-Two validation cycles are recorded here:
-
-1. **FY2024 consolidation engine** — the deterministic accounting engine,
-   independent recomputation, API and frontend (below).
-2. **Phase 1 foundation** — project setup and Docker infrastructure
-   (retained further down for history).
+How we know the outputs are correct: the checks that are coded, the figures
+recomputed independently, and the AI-tool implementation mistakes that were
+found and fixed — each with the commit that fixed it.
 
 Environment: macOS, Node 22, Python 3.11, Next.js 16.4.3.
 
+> **Read this first — two honest gaps.**
+> The figures below were re-run on 2026-11-03 from the current commit
+> (`28f3b43`). They differ from the earlier run recorded previously in this
+> file, because commit `28f3b43` changed India's P&L. The independent
+> recomputation (`scripts/verify_independent.py`) still uses the pre-fix India
+> basis and therefore **no longer agrees with the engine**. This is disclosed
+> rather than papered over. See §3.
+
 ---
 
-# Part 1 — FY2024 consolidation engine
+## 1. One command produces all seven deliverables
 
-Validated 2026-11-01.
-
-## 1. One-command run produces all seven deliverables
-
-✅ `backend/.venv/bin/python scripts/run_consolidation.py` writes:
+`backend/.venv/bin/python scripts/run_consolidation.py` (run 2026-11-03) wrote:
 
 ```
-consolidated_tb.csv (3360 bytes)   balance_sheet.json (3434 bytes)
-profit_and_loss.json (2496 bytes)  changes_in_equity.json (2456 bytes)
-eliminations.csv (3391 bytes)      issues.json (9947 bytes)
-control_figures_ns.json (728 bytes)
+consolidated_tb.csv (3358 bytes)   balance_sheet.json (3434 bytes)
+profit_and_loss.json (2495 bytes)  changes_in_equity.json (2455 bytes)
+eliminations.csv (3391 bytes)      issues.json (9842 bytes)
+control_figures_ns.json (712 bytes)
 ```
 
-and prints the twelve control figures. Deterministic — no network, no LLM.
+and printed the twelve control figures. Fully deterministic — no network
+access and no LLM call is required. Re-running produces the same files.
 
-## 2. Twelve control figures
+## 2. Twelve control figures (engine output, 2026-11-03)
 
 | Figure | Value (GBP) |
 |---|---|
-| Group revenue | 30,203,422.23 |
-| Group profit | 3,069,352.53 |
-| Profit — owners | 2,991,424.52 |
+| Group revenue | 28,301,607.81 |
+| Group profit | 2,987,713.67 |
+| Profit — owners | 2,909,785.66 |
 | Profit — NCI | 77,928.01 |
 | NCI at 31 Dec | 1,341,888.19 |
 | Goodwill at 31 Dec | 1,375,815.07 |
 | Translation reserve movement | −108,138.43 |
-| Total assets | 28,575,272.95 |
-| Total equity | 18,446,143.15 |
+| Total assets | 28,596,245.74 |
+| Total equity | 18,531,898.56 |
 | Intercompany difference | 20,066.42 |
 | UK SGD bank (GBP) | `null` + reason (no GBP/SGD closing rate) |
 | Journals | 15 posted · 2 rejected · 2 held for review |
 
-## 3. Independent recomputation (the correctness gate)
+## 3. Independent recomputation — and its current divergence
 
-✅ `scripts/verify_independent.py` recomputes every figure from the raw source
-files with its **own** `Decimal` arithmetic and shares **no code** with the
-engine. It reproduces every control figure exactly:
+`scripts/verify_independent.py` recomputes the figures from the raw source
+files with its **own** `Decimal` arithmetic, sharing no code with the engine.
+
+**Status: NOT clean as of 2026-11-03.** The script still builds India from the
+full Apr–Dec trial balance (`tb_in.csv`), i.e. the pre-`28f3b43` basis. The
+engine now builds India from the Jul–Dec monthly rows. The script prints:
 
 ```
-group_revenue 30203422.23        group_profit 3069352.53
-profit_owners 2991424.52         profit_nci 77928.01
-nci_closing 1341888.19           goodwill_closing 1375815.07
-translation_reserve_movement -108138.43
-total_assets 28575272.95         total_equity 18446143.15
+group_revenue 30203422.23     group_profit 3069352.53
+profit_owners 2991424.52      profit_nci 77928.01
+```
+
+which do **not** equal the engine's `28,301,607.81 / 2,987,713.67 /
+2,909,785.66`. The residual is exactly the Apr–Jun India profit
+(`28f3b43`'s subject). What the script *does* still prove, and still matches
+the engine on, is the balance-sheet identity and the balance-sheet totals:
+
+```
 check A = L + E: 0.00
 ```
 
-The script also re-derives, independently: the journal decisions
-(15 posted / 2 rejected / 2 held), the intercompany difference and its
-causes, goodwill (INR 147,600,000 → GBP 1,375,815.07), NCI at acquisition
-(INR 135,600,000 → GBP 1,263,960.19), the India H2 profit split, and the
-balance-sheet identity A = L + E (difference 0.00).
+**Gap to close before submission:** update `verify_independent.py` to the
+Jul–Dec monthly basis so the gate agrees again. Until then, this file does not
+claim the independent recomputation passes — it does not.
 
-## 4. Integrity checks (all pass)
+## 4. Integrity checks (engine, all pass on the current commit)
 
-- `balance_sheet_balances` — assets 28,575,272.95 = liabilities 10,129,129.80
-  + equity 18,446,143.15.
-- `profit_split_reconciles` — owners 2,991,424.52 + NCI 77,928.01 = group
-  profit 3,069,352.53.
-- `consolidated_tb_balances` — total debits 59,898,044.40 = total credits
-  59,898,044.40 (difference 0.00).
+- `balance_sheet_balances` — assets 28,596,245.74 = liabilities 10,064,347.18 +
+  equity 18,531,898.56.
+- `profit_split_reconciles` — owners 2,909,785.66 + NCI 77,928.01 = group profit
+  2,987,713.67.
+- `consolidated_tb_balances` — total debits 58,077,868.84 = total credits
+  58,077,868.84 (difference 0.00).
 - `elimination_journals_balance` — all 4 elimination journals balance.
 
 ## 5. Backend tests
 
-✅ `pytest -q` on Python 3.11 — **303 passed**. Includes regression tests for
-JE-016 being rejected in full (unmapped line), the in-transit intercompany
-item being reciprocal (not routed to FX), the translation reserve being the
-genuine FX movement (never a plug), statement footing, the consolidated TB
-balancing, balanced elimination journals, and TB source traceability.
+**NOT passing as of 2026-11-03.** `pytest -q` → **31 failed, 272 passed**. The
+failures are concentrated in tests that assert the pre-`28f3b43` India basis
+(e.g. `test_statements.py::test_group_profit_recomputed_from_p_and_l`) and in
+MCP-server tests. Earlier documentation claimed 303 passing; that is no longer
+true and is corrected here. **Gap to close:** reconcile the tests with the
+current engine.
 
-## 6. API
+## 6. API, frontend and source data (not re-tested this session)
 
-✅ `POST /api/consolidations/runs` → HTTP 200, `status: completed`, 12 stages
-completed, 31 consolidated-TB rows, 13 elimination lines, 4 integrity checks
-all pass, 7 output files listed. `GET /api/consolidations/runs` returns the
-persisted history; `GET .../runs/{id}` returns the full record;
-`GET .../output/{file}` returns the deliverables (verified `text/csv` for
-`consolidated_tb.csv`, 200 for the JSON files).
-
-## 7. Frontend
-
-✅ `npm run lint` — 0 errors, 0 warnings.
-✅ `npm run build` — compiles, type-checks, prerenders all 12 routes.
-✅ Live smoke test against the API: `/dashboard/reports`, `/dashboard/runs`
-and `/dashboard/issues` each return HTTP 200 and render the engine's figures
-(statements, control figures, trial balance, eliminations, integrity checks
-and the seven downloadable deliverables).
-
-## 8. Source data unchanged
-
-✅ The 17 files under `data/northwind/` are untouched: the engine only reads
-them (the backend mounts `data/` read-only). Checksums match the originals.
+- `POST /api/consolidations/runs` and the download endpoints were validated
+  earlier (run history, full run record, `text/csv` for `consolidated_tb.csv`);
+  they were **not re-run** in this documentation pass.
+- `npm run lint` / `npm run build` were validated earlier; **not re-run** here.
+- The 17 files under `data/northwind/` are untouched: the engine only reads
+  them (the backend mounts `data/` read-only).
 
 ---
 
-## AI mistakes found and corrected
+## AI mistakes found and corrected (with the fixing commit)
 
 The AI-assisted stages are advisory and are verified deterministically, but
-several **implementation** mistakes surfaced and were fixed — recorded here as
-required evidence:
+several **implementation** mistakes surfaced. Each is listed with the commit
+that fixed it, verified against the real Git history.
 
-1. **Unbalanced elimination journals (sign errors).** `ELIM-PL-001` and
-   `ELIM-INV-001` were emitted with mismatched debit/credit signs, so the
-   elimination journals did not balance. Fixed so each is a balanced
-   double-entry journal; the investment journal now also carries the goodwill
-   and translation-reserve residual. The new `elimination_journals_balance`
-   check guards against regression.
-2. **Consolidated trial balance out of balance by the group profit.** The TB
-   closed the P&L into retained earnings while the P&L accounts were still
-   present, double-counting the year's result and leaving the TB short by
-   exactly the group profit. Fixed by using the open-ledger basis (P&L
-   accounts stay open). The new `consolidated_tb_balances` check guards it.
-3. **Elimination sign bug in the group-account net presentation.** The
-   aggregate elimination netted the wrong side for intercompany payables;
-   corrected against the independently recomputed intercompany residual.
-4. **Stale skill/spec text asserted capabilities did not exist.** The
-   `ConsolidationSkill` docstring and `SkillSpec` still claimed translation,
-   elimination and statement assembly were "not implemented" and that
-   `complete` could never be true. Corrected to match the shipped engine.
-   (A wrong self-description is itself a defect — reviewers would be misled.)
-5. **Translation reserve was a balancing plug, not an exchange difference.**
-   The investment-elimination journal (`ELIM-INV-001`) credited £1,288,166.08
-   to the translation reserve (3300) with no FX basis, leaving the reported
-   reserve movement (−£147,343.09) as a plug that absorbed every other
-   imbalance. Corrected so 3300 carries only the genuine, derivable exchange
-   difference (the India acquisition-to-closing movement, −£108,138.43); the
-   investment-elimination residual is routed to retained earnings, and the
-   part of the opening position that cannot be derived from source (no US
-   opening position is supplied) is **disclosed** as an issue
-   (`opening_position_unreconciled`) instead of being hidden in the reserve.
-6. **Partially-posted journal with an unmapped line.** `JE-016` (India) had
-   one line on an unmapped account (`IN-GST-ITC`); the engine posted the
-   mapped line and skipped the unmapped one, leaving India unbalanced by
-   INR 540,000. Corrected: a journal whose lines are not *all* mapped to the
-   group chart of accounts is rejected **in full** (policy §6) — no
-   one-sided entries.
-7. **In-transit intercompany item treated as an exchange difference.** The
-   £20,066.42 intercompany balance difference was posted entirely to the FX
-   account (7300), overstating the group FX loss. Only £11,957.88 (the
-   document-vs-booked-rate difference on the four matched invoices) is a
-   genuine exchange difference; the £8,108.54 in-transit item is now
-   recognised on both sides at the closing rate (`ELIM-TRANSIT-*`) and
-   eliminates to zero (policy §5).
-8. **Reported statements did not foot.** Each line is rounded to 2 dp
-   independently (policy §7), so in three places the rounded lines summed to
-   a penny different from the reported total. Fixed by footing every summary
-   section (assets, liabilities, equity, P&L components) to its total,
-   absorbing the presentation residual in the largest line — never changing
-   the total. Regression tests assert every section foots.
+### M1. India's P&L included the pre-acquisition quarter — fixed in `28f3b43`
 
----
+India was acquired on 1 July 2024, but `tb_in.csv` covers the full Apr–Dec
+period, so every India P&L line was overstated by its Apr–Jun amount
+(INR 18,000,000 of profit belonging to the previous owners). The AI's own
+self-review flagged this as "the biggest error"; it was first fixed in the
+working tree over several sessions, then committed as
+**`28f3b43b7b3b03f31c442dd2787e78d3e3fb0b4e`** ("FIX 1: build a mid-year
+acquisition's P&L from the monthly rows only"), which rebuilds India's P&L from
+`in_pl_monthly.csv` rows with `month >= acquisition month`, translated at the
+H2-average rate, and blocks the run if the monthly totals do not tie to the TB.
 
-# Part 2 — Phase 1 foundation (history)
+### M2. The SGD bank balance summed every foreign-currency row — fixed in `28f3b43`
 
----
+The first implementation (`_sgd_bank`) totalled every TB row whose transaction
+currency was not GBP, which wrongly included the UK's USD intercompany payable.
+The AI proposed filtering to the foreign-currency **bank** account only
+(group 1100); the replacement `_foreign_currency_bank` also moved the missing-
+rate reason inside the `sgd_bank_gbp` value so the file keeps exactly the 12
+required keys. Both changes landed in
+**`28f3b43b7b3b03f31c442dd2787e78d3e3fb0b4e`** (confirmed with
+`git log -S"_foreign_currency_bank"`).
 
-## 1. `docker compose config`
+### M3. In-transit intercompany item had a missing leg / FX routed whole — fixed in `aeab17c`
 
-✅ `docker compose config --quiet` exits 0. Services resolved:
-`frontend`, `backend`, `db`.
+The AI credited the UK payable for the in-transit invoice (£8,108.54) with no
+matching debit, leaving group profit overstated and the missing amount absorbed
+into a residual; it also posted the full £20,066.42 intercompany difference to
+FX. The audit prompted the split treatment (in-transit recognised on both sides
+at closing and eliminated to zero; only the £11,957.88 booking-rate difference
+posted to 7300). The corrected eliminations/intercompany logic is contained in
+**`aeab17c17b940189fde78a7d740bdacd6003e7f5`** ("build deterministic accounting
++ advisory AI"). **Caveat:** this is *not a dedicated fix commit* — the fix was
+made in the working tree and is bundled into the single engine commit, so no
+commit isolates just this change.
 
-## 2. Build all images
+### M4. Reported statements did not foot — fixed in `aeab17c`
 
-✅ `docker compose build` — `frontend` built (multi-stage: deps → build →
-standalone runner), `backend` built (python:3.11-slim + pip install),
-`db` uses the official `postgres:16-alpine` image (pull only, no build).
+Each line is rounded to 2 dp independently (policy §7), so in several places
+the rounded lines summed to a penny different from the reported total. Fixed by
+footing every summary section to its total, absorbing the presentation residual
+in the largest line while never changing the total (`_foot_section`). Introduced
+in **`aeab17c17b940189fde78a7d740bdacd6003e7f5`**.
 
-## 3. Start all services
+### M5. Stale skill/spec text claimed capabilities did not exist — fixed in `aeab17c`
 
-✅ `docker compose up -d` — all three containers start and reach
-**healthy**:
+The `ConsolidationSkill` docstring and `SkillSpec` still said translation,
+elimination and statement assembly were "not implemented" and that `complete`
+could never be true. Corrected in
+**`aeab17c17b940189fde78a7d740bdacd6003e7f5`**.
 
-| Service | Status | Port |
-|---|---|---|
-| frontend | Up (healthy) | 0.0.0.0:3000 → 3000 |
-| backend | Up (healthy) | 0.0.0.0:8000 → 8000 |
-| db | Up (healthy) | 0.0.0.0:5432 → 5432 |
+### Commit-coverage gap (explicit)
 
-## 4. Frontend loads
-
-✅ From the host:
-
-- `GET /` → **307** redirect to `/dashboard`
-- `GET /dashboard` → **200**; page contains LedgerFlow branding and nav
-- `GET /dashboard/entities`, `/source-data`, `/runs`, `/issues`,
-  `/reports`, `/agent-activity` → **200** each
-
-## 5. Backend health endpoint
-
-✅ `curl http://localhost:8000/api/health` →
-
-```json
-{"status": "ok", "service": "ledgerflow-backend"}
-```
-
-✅ `GET /` returns application identification
-(`name`, `service`, `version`, `phase`, `description`).
-
-## 6. PostgreSQL health
-
-✅ Container reports healthy; `docker exec ledgerflow-db pg_isready -U
-ledgerflow -d ledgerflow` → `/var/run/postgresql:5432 - accepting
-connections`.
-
-**Environment note:** host port 5432 was initially occupied by an unrelated
-`websage-db` container from another project; that project was stopped by the
-user before this validation. LedgerFlow's compose file keeps the standard
-`5432:5432` mapping. No LedgerFlow code depends on this port.
-
-## 7. Application works without PostgreSQL
-
-✅ `docker compose stop db` → database container stops; frontend and backend
-both remain **healthy** and responsive:
-
-- `GET http://localhost:3000/dashboard` → 200
-- `GET http://localhost:3000/dashboard/reports` → 200
-- `GET http://localhost:8000/api/health` → `{"status": "ok", ...}`
-
-✅ Decoupling audit:
-
-- `grep` over `backend/app/**` and `backend/pyproject.toml` finds **no**
-  database drivers, connection strings or `DATABASE_URL` (only docstrings
-  mentioning PostgreSQL as future infrastructure).
-- The `backend` service in `docker-compose.yml` has **no `depends_on`** and
-  **no `POSTGRES_*` variables**.
-
-The db service was restarted afterwards; final state: all three healthy.
-
-## 8. Source data unchanged
-
-✅ SHA-256 for all 17 files in `data/northwind/` matches:
-
-1. the checksums recorded at import time (unchanged since copy), and
-2. the pristine original bundle outside the repository.
-
-Original filenames and timestamps preserved (`entities.csv` still
-`Oct 21 11:55`, 345 bytes). The backend mounts `data/` **read-only**.
-
-## 9. Frontend lint and production build
-
-✅ `npm run lint` (ESLint 9, flat config) — 0 errors, 0 warnings.
-✅ `npm run build` (Next.js 16 Turbopack) — compiles, type-checks,
-prerenders all 9 routes as static output (`standalone`).
-✅ Standalone smoke test: `node .next/standalone/server.js` serves
-`/` (307) and dashboard routes (200).
-
-Note: Next.js 16 removed `next lint`; `next build` no longer runs lint, so
-lint and build are validated as separate steps.
-
-## 10. Backend tests
-
-✅ `pytest` on Python 3.11 — **5 passed** (health endpoint, root endpoint,
-CORS for the frontend origin, storage layout creation, immutable
-source-data path). One dependency deprecation warning
-(`fastapi.testclient` suggests `httpx2`) — non-blocking.
+Of the five mistakes above, only **M1 and M2 have a distinct, attributable fix
+commit (`28f3b43`)**. **M3, M4 and M5 cannot be tied to a dedicated fix
+commit**: the repository keeps a single engine commit (`aeab17c`) plus one
+further fix (`28f3b43`), and the intermediate fixes were made in the working
+tree without being committed individually. Two `git stash` entries
+(`stash@{0}`, `stash@{1}`) and their base commits remain in the object store as
+evidence that intermediate states existed, but they are not commits on the main
+history. No commit hash is invented here to fill the gap.
 
 ---
 
-## Issues found and fixed during validation
+## Appendix — Phase 1 foundation (earlier work, retained for history)
 
-1. **`asChild` type error** (first frontend build) — shadcn's base-nova
-   preset uses Base UI, whose composition prop is `render`. Switched the
-   mobile menu trigger to `render={<Button … />}`.
-2. **Unused `LucideIcon` import** in `src/lib/nav.ts` — removed (ESLint).
-3. **Self-referential `--font-sans: var(--font-sans)`** written by shadcn
-   init — repointed at the Geist font variables the root layout sets.
-4. **Port 5432 conflict** with the unrelated `websage-db` container —
-   resolved by the user stopping that project (environmental, not a repo
-   defect).
+Validated on 2026-10-31 at commit `765492c`:
 
-## Post-review update (same day)
-
-At the maintainer's request, all backend `__init__.py` files were removed:
-
-- Re-ran validation after the change: `pip install -e ".[dev]"` (fresh),
-  **pytest 5/5 passed**, backend image rebuilt, container **healthy**,
-  `GET /api/health` → `{"status": "ok", ...}` — namespace-package discovery
-  confirmed working in the real image.
-- Added `backend/conftest.py` so tests write storage to a temp dir instead
-  of the working directory (removed stray `backend/storage`,
-  `backend/output` created by earlier test runs).
-- Tightened `backend/.dockerignore` (`**/__pycache__`) — rebuilt image no
-  longer contains host bytecode; `/app/app` verified clean in the container.
-
-## Unresolved issues
-
-None affecting Phase 1 requirements. The `httpx2` deprecation warning is
-worth revisiting at the next dependency upgrade.
+- `docker compose config --quiet` exits 0; services `frontend`, `backend`,
+  `db` all reach **healthy**.
+- `GET /` → 307 redirect to `/dashboard`; dashboard routes → 200.
+- `curl /api/health` → `{"status": "ok", "service": "ledgerflow-backend"}`.
+- `docker compose stop db` leaves frontend and backend healthy (no DB
+  coupling); no `DATABASE_URL` or driver anywhere in `backend/app`.
+- `pytest` → 5 passed; `npm run lint` → 0 errors; `npm run build` → all routes
+  prerendered.
+- SHA-256 of all 17 files in `data/northwind/` matches the originals.

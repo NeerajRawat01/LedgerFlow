@@ -76,10 +76,10 @@ The prototype writes these to `/output` by running one command
 | Item | Status |
 |------|--------|
 | README (setup, architecture, reproducible run) | Done |
-| Architecture doc | Done |
-| DECISIONS.md (5–7 decisions) | Done |
-| VALIDATION.md (checks, recomputations, ≥3 AI mistakes) | Done |
-| AI transcripts (secrets redacted) | Done (redacted run traces under `storage/agent_logs/traces/`) |
+| Architecture doc (≤ 6 pages) | Done |
+| DECISIONS.md (5–7 decisions) | Done (6) |
+| VALIDATION.md (checks, recomputation, ≥3 AI mistakes) | Partial — mistakes + fix commits recorded; independent recomputation currently diverges from the engine (India basis), backend tests 31 failing |
+| AI tool transcripts (secrets redacted) | Done — full OpenCode session records in `transcripts/` (10 sessions), secrets redacted |
 | One-page reflection | Done |
 
 ## G. Integrity rules (never violate)
