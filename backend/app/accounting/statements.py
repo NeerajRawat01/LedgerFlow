@@ -83,14 +83,9 @@ _ONE = Decimal("1")
 # division can leave an infinitesimal (<1e-19) residual far below a penny.
 _ROUNDING_TOLERANCE = Decimal("0.005")
 
-# Entity functional currencies (from the entity master).
-ENTITY_CURRENCIES = {"US": "USD", "UK": "GBP", "IN": "INR"}
-
-# Entities acquired mid-year (income/expenses at H2 average, partial-year).
-ACQUISITION_DATES = {"IN": "2024-07-01"}
-
 # Equity accounts are translated at historical rates and assembled separately.
 EQUITY_ACCOUNTS = {"3100", "3200", "3300", "3400"}
+
 
 # Intercompany and investment accounts.
 IC_RECEIVABLE = "1250"
@@ -700,14 +695,28 @@ class StatementAssembler:
         Returns, per entity, ``{"pl": {code: gbp_net}, "bs": {code: gbp_net}}``
         where net is ``debit - credit`` in GBP. Equity accounts are excluded
         (handled at assembly from historical balances).
+
+        An entity acquired mid-year (India) contributes only from its
+        acquisition month. Its P&L is therefore rebuilt **only** from the
+        monthly P&L rows on or after the acquisition month (translated at the
+        period-of-inclusion average, H), and the monthly total for each ledger
+        is tied to that entity's trial balance — a mismatch blocks the run.
+        Revenue/expenses earned before the acquisition (the Apr–Jun quarter)
+        belong to the previous owners and are not group profit.
         """
         result: dict[str, dict[str, Any]] = {}
         for entity, data in entity_data.items():
             currency = data.currency
+            acquisition_date = self._acquisition_date(entity)
+            if acquisition_date and self._is_partial_year(acquisition_date):
+                balances = dict(balances)
+                balances[entity] = self._partial_year_pl_balances(
+                    entity, data, acquisition_date
+                )
             policy = FXTranslator.policy_for_entity(
                 entity,
                 currency,
-                acquisition_date=ACQUISITION_DATES.get(entity),
+                acquisition_date=acquisition_date,
             )
             closing_rate = self._rate(currency, FXRateType.CLOSING)
             income_rate = self._rate(currency, policy.income_rate_type)
@@ -763,6 +772,190 @@ class StatementAssembler:
         """Resolve ``currency -> GBP`` at ``rate_type``; never invent a rate."""
         resolved = self.fx.resolve(currency, self.presentation_currency, rate_type)
         return resolved.rate
+
+    # ------------------------------------------------------------------
+    # Entity master (entities.csv) — no hardcoded currencies/dates
+    # ------------------------------------------------------------------
+
+    def _entities_master(self) -> dict[str, dict[str, str]]:
+        """The entity master keyed by upper-case entity id (entities.csv)."""
+        cached = getattr(self, "_entity_master", None)
+        if cached is None:
+            cached = {}
+            for row in self.service.list_entities():
+                key = (row.get("entity_id") or "").strip().upper()
+                if key:
+                    cached[key] = row
+            self._entity_master = cached
+        return cached
+
+    def _entity_currency(self, entity: str) -> str:
+        """Functional currency for ``entity`` from the entity master."""
+        row = self._entities_master().get(entity.strip().upper())
+        if row and (row.get("functional_currency") or "").strip():
+            return row["functional_currency"].strip().upper()
+        data = getattr(self, "_entity_data", {}).get(entity.strip().upper())
+        if data is not None:
+            return data.currency
+        return self.presentation_currency
+
+    def _acquisition_date(self, entity: str) -> str | None:
+        """Acquisition date for ``entity`` from the entity master, if any.
+
+        Returns any recorded acquisition date; the caller decides whether it
+        makes the entity partial-year via :meth:`_is_partial_year`.
+        """
+        row = self._entities_master().get(entity.strip().upper())
+        if not row:
+            return None
+        date = (row.get("acquisition_date") or "").strip()
+        return date or None
+
+    # The group reporting period (FY2024). A subsidiary acquired after the
+    # start of the reporting year is consolidated only from its acquisition
+    # date, so its income/expenses belong to the period of inclusion (H2).
+    _REPORTING_PERIOD_START = "2024-01-01"
+    _REPORTING_PERIOD_END = "2024-12-31"
+
+    def _is_partial_year(self, acquisition_date: str) -> bool:
+        """True when an entity joins the group part-way through the year.
+
+        An entity acquired on or after 1 July of the reporting year is
+        consolidated for H2 only (income/expenses at the H2 average, P&L built
+        from the monthly movements on/after the acquisition month).
+        """
+        return (
+            self._REPORTING_PERIOD_START
+            < acquisition_date
+            <= self._REPORTING_PERIOD_END
+            and acquisition_date >= f"{self._REPORTING_PERIOD_END[:4]}-07-01"
+        )
+
+    def _partial_year_pl_balances(
+        self,
+        entity: str,
+        data: _EntityData,
+        acquisition_date: str,
+        *,
+        reporting_year_end: str = "2024-12-31",
+    ) -> dict[str, list[Decimal]]:
+        """Rebuild a mid-year acquisition's P&L from its monthly movements.
+
+        Only months **on or after** the acquisition month are included: the
+        pre-acquisition result belongs to the previous owners and is part of
+        net assets at acquisition, not group profit. Each ledger's monthly
+        total is tied to that entity's trial balance; any difference blocks the
+        run (no figure is ever absorbed).
+
+        Returns ``{group_code: [debit, credit]}`` in the entity's functional
+        currency, restricted to the included months, and merged with the
+        entity's non-P&L balances so the caller can translate it as usual.
+        """
+        acq_month = acquisition_date[:7]
+        monthly = self.service.get_monthly_pnl(entity)
+        if not monthly:
+            raise ServiceError(
+                f"{entity} was acquired mid-year ({acquisition_date}) but no "
+                f"monthly P&L is available to build its partial-year result",
+                details={"entity": entity, "acquisition_date": acquisition_date},
+            )
+
+        # Monthly totals per ledger code, split into "all months" (for the
+        # tie-out to the TB) and "included months" (on/after the acquisition).
+        all_total: dict[str, Decimal] = defaultdict(lambda: _ZERO)
+        included: dict[str, list[Decimal]] = defaultdict(lambda: [_ZERO, _ZERO])
+        for row in monthly:
+            ledger = (row.get("ledger_code") or "").strip()
+            month = (row.get("month") or "").strip()
+            amount = Decimal((row.get("amount") or "0").strip() or "0")
+            dr_cr = (row.get("dr_cr") or "").strip().lower()
+            all_total[ledger] += amount
+            if month < acq_month:
+                continue
+            if dr_cr == "cr":
+                included[ledger][1] += amount
+            else:
+                included[ledger][0] += amount
+
+        # Tie the monthly totals to the trial balance per ledger code.
+        tb_by_local: dict[str, Decimal] = {}
+        for row in data.trial_balance.rows:
+            tb_by_local[row.local_account_code] = (
+                tb_by_local.get(row.local_account_code, _ZERO)
+                + row.debit
+                + row.credit
+            )
+        mismatches: list[str] = []
+        for ledger, total in sorted(all_total.items()):
+            tb_amount = tb_by_local.get(ledger)
+            if tb_amount is None:
+                mismatches.append(f"{ledger}: monthly {total} has no TB row")
+                continue
+            if abs(tb_amount - total) > _ROUNDING_TOLERANCE:
+                mismatches.append(
+                    f"{ledger}: monthly {total} vs trial balance {tb_amount} "
+                    f"(difference {tb_amount - total})"
+                )
+        if mismatches:
+            self._add_issue(
+                code="monthly_pl_tb_mismatch",
+                severity=Severity.ERROR,
+                message=(
+                    f"{entity} monthly P&L does not tie to its trial balance "
+                    f"for: " + "; ".join(mismatches)
+                ),
+                action="blocked",
+                entity=entity,
+                source_file="in_pl_monthly.csv",
+                details={"mismatches": mismatches},
+            )
+            raise ServiceError(
+                f"{entity} monthly P&L does not tie to the trial balance: "
+                + "; ".join(mismatches),
+                details={"entity": entity, "mismatches": mismatches},
+            )
+
+        # Start from the entity's full balances (so non-P&L items are kept),
+        # then replace every P&L group account with the included-month valuation.
+        balances: dict[str, list[Decimal]] = defaultdict(lambda: [_ZERO, _ZERO])
+        for row in data.mapped.rows:
+            if not row.mapped or not row.group_account_code:
+                continue
+            account = self.mapper.group_coa.get(row.group_account_code)
+            if account is not None and account.statement == "PL":
+                continue
+            balances[row.group_account_code][0] += row.debit
+            balances[row.group_account_code][1] += row.credit
+
+        local_to_group = self._local_to_group_lookup(entity)
+        for ledger, (debit, credit) in included.items():
+            group_code = local_to_group.get(ledger)
+            if group_code is None:
+                continue
+            account = self.mapper.group_coa.get(group_code)
+            if account is None or account.statement != "PL":
+                continue
+            balances[group_code] = [
+                balances[group_code][0] + debit,
+                balances[group_code][1] + credit,
+            ]
+        return balances
+
+    def _local_to_group_lookup(self, entity: str) -> dict[str, str]:
+        """A stable local→group account lookup for one entity."""
+        cached = getattr(self, "_local_group_lookups", None)
+        if cached is None:
+            cached = {}
+            self._local_group_lookups = cached
+        if entity in cached:
+            return cached[entity]
+        lookup: dict[str, str] = {}
+        for row in self._entity_data.get(entity).mapped.rows if entity in self._entity_data else []:
+            if row.mapped and row.group_account_code:
+                lookup.setdefault(row.local_account_code, row.group_account_code)
+        cached[entity] = lookup
+        return lookup
+
 
     # ------------------------------------------------------------------
     # Stage 4-6: combine + eliminate
@@ -1223,8 +1416,8 @@ class StatementAssembler:
         # -- Intercompany difference ---------------------------------------
         ic_difference = self._intercompany_difference()
 
-        # -- SGD bank ------------------------------------------------------
-        sgd_bank, sgd_reason = self._sgd_bank()
+        # -- Foreign-currency bank balances (e.g. the UK SGD account) ------
+        sgd_bank, sgd_reason = self._foreign_currency_bank()
 
         # -- Journals ------------------------------------------------------
         posted = sum(1 for d in decisions if d.status is JournalStatus.POSTED)
@@ -1519,7 +1712,7 @@ class StatementAssembler:
         if group_code is None:
             return _ZERO
         debit, credit = data.get(group_code, [_ZERO, _ZERO])
-        rate = self._rate(ENTITY_CURRENCIES.get(entity, "GBP"), FXRateType.CLOSING)
+        rate = self._rate(self._entity_currency(entity), FXRateType.CLOSING)
         return (credit - debit) * rate
 
     def _entity_balances_raw(self, entity: str) -> dict[str, list[Decimal]]:
@@ -1586,33 +1779,70 @@ class StatementAssembler:
             "unmatched_items": reconciliation.unmatched_count,
         }
 
-    def _sgd_bank(self) -> tuple[Decimal | None, str | None]:
-        """The UK SGD bank balance in GBP, or ``None`` with a reason."""
-        if self.presentation_currency == "GBP":
-            try:
-                self.fx.resolve("SGD", "GBP", FXRateType.CLOSING)
-            except LedgerFlowError:
-                self._add_issue(
-                    code="missing_sgd_closing_rate",
-                    severity=Severity.WARNING,
-                    message=(
-                        "no GBP/SGD closing rate is recorded, so the UK SGD "
-                        "bank balance (SGD 40,000, booked GBP 23,010) cannot be "
-                        "translated at the closing rate; sgd_bank_gbp is null"
-                    ),
-                    action="blocked",
-                    entity="UK",
-                    source_file="tb_uk.csv",
-                    account_code="1210",
-                    affected_amount=Decimal("40000.00"),
-                    details={"functional_currency": "SGD", "reason": "missing_fx_rate"},
-                )
-                return None, (
-                    "no GBP/SGD closing rate is recorded; a cross-rate cannot be "
-                    "derived without a USD/SGD rate"
-                )
-        # If a rate were present, translate the booked GBP value (already GBP).
-        return Decimal("23010.00"), None
+    def _foreign_currency_bank(self) -> tuple[Decimal | None, str | None]:
+        """Translate foreign-currency bank balances found in the source TB.
+
+        Scans every entity's trial balance for rows whose transaction currency
+        differs from the group presentation currency, and translates them at the
+        closing rate. Nothing is hardcoded: the amounts come from the source
+        rows, so changing an input row (or adding a rate) changes the result.
+
+        Returns the total translated value in GBP, or ``None`` with a reason
+        when a required rate is missing. If no such row exists, returns zero.
+        """
+        if self.presentation_currency != "GBP":
+            return _ZERO, None
+
+        total = _ZERO
+        missing: list[str] = []
+        for entity in sorted(getattr(self, "_entity_data", {})):
+            data = self._entity_data[entity]
+            for row in data.trial_balance.rows:
+                txn_ccy = (row.txn_currency or "").strip().upper()
+                if not txn_ccy or txn_ccy == self.presentation_currency:
+                    continue
+                # The foreign-currency amount is the source transaction amount;
+                # fall back to the booked balance only if none is recorded.
+                amount = row.txn_amount if row.txn_amount is not None else row.signed_balance
+                if amount is None:
+                    continue
+                try:
+                    resolved = self.fx.resolve(
+                        txn_ccy, self.presentation_currency, FXRateType.CLOSING
+                    )
+                except LedgerFlowError:
+                    missing.append(f"{entity} {row.local_account_code} ({txn_ccy})")
+                    self._add_issue(
+                        code="missing_fx_rate",
+                        severity=Severity.WARNING,
+                        message=(
+                            f"no {self.presentation_currency}/{txn_ccy} closing "
+                            f"rate is recorded, so {entity} account "
+                            f"{row.local_account_code} ({txn_ccy} {amount}) cannot "
+                            f"be translated at the closing rate"
+                        ),
+                        action="blocked",
+                        entity=entity,
+                        source_file=row.source_file,
+                        source_row=row.source_row,
+                        account_code=row.local_account_code,
+                        affected_amount=amount,
+                        details={
+                            "transaction_currency": txn_ccy,
+                            "reason": "missing_fx_rate",
+                        },
+                    )
+                    continue
+                total += amount * resolved.rate
+
+        if missing:
+            reason = (
+                "no closing rate recorded for "
+                + ", ".join(missing)
+                + "; a cross-rate cannot be derived"
+            )
+            return None, reason
+        return total, None
 
     def _integrity_checks(
         self,
