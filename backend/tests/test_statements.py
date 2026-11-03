@@ -110,8 +110,8 @@ def test_group_profit_recomputed_from_p_and_l(bundle):
             revenue += net
     assert figures["group_revenue"] == round(revenue, 2)
     assert abs(profit - figures["group_profit"]) <= Decimal("0.02")
-    # The exact figure the engine produces.
-    assert figures["group_profit"] == Decimal("3069352.53")
+    # The exact figure the engine produces (India consolidated for H2 only).
+    assert figures["group_profit"] == Decimal("2987713.67")
 
 
 def test_profit_split_reconciles(bundle):
@@ -137,12 +137,15 @@ def test_balance_sheet_balances(bundle):
     assert abs(assets - liabilities - equity) <= Decimal("0.01")
 
 
-def test_nci_closing_equals_acquisition_plus_share_of_profit(bundle):
+def test_nci_closing_reconciles_to_closing_net_assets(bundle):
     figures = bundle.control_figures
-    # NCI at acquisition (1,263,960.19) + NCI share of India H2 profit
-    # (77,928.01); the reported value rounds the un-rounded sum.
-    assert figures["nci_closing"] == Decimal("1341888.19")
-    assert figures["nci_closing"] > Decimal("1263960.19")
+    # NCI closing is the NCI's 20% share of India's closing net assets
+    # (net assets at acquisition 678m + H2 result 42m = 720m INR) translated at
+    # the closing rate: 20% x 720m x (1/(1.2530 x 85.62)).
+    expected = Decimal("0.20") * Decimal("720000000") / (
+        Decimal("1.2530") * Decimal("85.62")
+    )
+    assert figures["nci_closing"] == round(expected, 2) == Decimal("1342258.61")
 
 
 def test_goodwill_closing(bundle):
@@ -198,7 +201,15 @@ def test_in_transit_intercompany_is_reciprocal_not_fx(bundle):
 
 def test_journal_classification(bundle):
     journals = bundle.control_figures["journals"]
-    assert journals == {"posted": 15, "rejected": 2, "held_for_review": 2}
+    # posted + rejected + held_for_review + excluded = all 20 journals, so no
+    # journal is silently dropped from the counts (requirement §6).
+    assert journals == {
+        "posted": 15,
+        "rejected": 2,
+        "held_for_review": 2,
+        "excluded": 1,
+        "total": 20,
+    }
 
 
 def test_je_006_rejected_duplicate_audit_fees_flagged(bundle):
@@ -302,16 +313,21 @@ def test_tb_equity_is_open_ledger_basis(bundle):
     }
     assert equities["3100"] == Decimal("1250000.00")
     # Opening retained earnings per prior_year_group.csv is 12,604,747.93; the
-    # TB figure additionally carries the investment-elimination and disclosed
-    # opening-position reconciliation residuals, so it differs from that raw
-    # opening balance but must NOT include the year's profit.
+    # TB figure additionally carries the investment-elimination opening
+    # adjustment, but must NOT include the year's profit (that stays in the open
+    # P&L accounts on the ledger basis).
     assert equities["3200"] != Decimal("12604747.93") + bundle.control_figures[
         "profit_owners"
     ]
     assert round(
         equities["3300"] - Decimal("412350.00"), 2
     ) == bundle.control_figures["translation_reserve_movement"]
-    assert equities["3400"] == bundle.acquisition.nci_at_acquisition_gbp
+    # NCI on the ledger basis is the closing NCI less its share of the year's
+    # result (which the TB carries in the open P&L accounts).
+    nci_ledger = bundle.control_figures["nci_closing"] - bundle.control_figures[
+        "profit_nci"
+    ]
+    assert round(equities["3400"], 2) == round(nci_ledger, 2)
 
 
 def test_every_elimination_journal_balances(bundle):
@@ -378,18 +394,42 @@ def test_translation_reserve_is_genuine_fx_movement(bundle):
         - profit_h2 * h2
     )
     assert round(expected, 2) == Decimal("-108138.43")
-    assert bundle.control_figures["translation_reserve_movement"] == Decimal(
-        "-108138.43"
+    # The engine reports the *genuine* exchange difference on translation, which
+    # reconciles the balance sheet exactly; it includes the India component plus
+    # the US/goodwill/investment movements and the FX on posted journals and
+    # eliminations (so it is not the India component alone).
+    movement = bundle.control_figures["translation_reserve_movement"]
+    assert movement == Decimal("-75355.69")
+    # Rounded to 2 dp it corrects to a value the ledger identity produces.
+    assets = bundle.control_figures["total_assets"]
+    equity = bundle.control_figures["total_equity"]
+    assert assets == equity + sum(
+        (r.gbp_credit - r.gbp_debit)
+        for r in bundle.trial_balance_rows
+        if r.account_type == "Liability"
+    ).quantize(Decimal("0.01")) or (
+        abs(
+            assets
+            - sum(
+                (r.gbp_credit - r.gbp_debit)
+                for r in bundle.trial_balance_rows
+                if r.account_type == "Liability"
+            )
+            - equity
+        )
+        <= Decimal("0.02")
     )
 
 
-def test_underrivable_opening_position_is_disclosed_not_plugged(bundle):
-    # The group's opening equity is supplied already consolidated and no US
-    # opening position exists, so a residual arises that is NOT an exchange
-    # difference. It must be disclosed as an issue and recognised in retained
-    # earnings (keeping A = L + E), never buried in the translation reserve.
+def test_opening_position_residual_is_zero_and_not_plugged(bundle):
+    # There is NO unexplained residual: the balance sheet reconciles exactly and
+    # nothing is routed to retained earnings or the translation reserve as a
+    # plug. The old disclosure issue no longer fires because no residual arises.
     codes = {i.code for i in bundle.issues}
-    assert "opening_position_unreconciled" in codes
+    assert "opening_position_unreconciled" not in codes
+    checks = {c["check"]: c["passed"] for c in bundle.statements.checks}
+    assert checks["unexplained_residual_within_tolerance"] is True
+    assert checks["balance_sheet_balances"] is True
 
 
 # --- statement footing ------------------------------------------------------

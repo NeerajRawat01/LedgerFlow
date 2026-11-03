@@ -158,7 +158,13 @@ def test_run_returns_control_figures(client: TestClient) -> None:
     assert figures is not None
     assert figures["group_profit"] is not None
     assert figures["total_assets"] is not None
-    assert figures["journals"] == {"posted": 15, "rejected": 2, "held_for_review": 2}
+    assert figures["journals"] == {
+        "posted": 15,
+        "rejected": 2,
+        "held_for_review": 2,
+        "excluded": 1,
+        "total": 20,
+    }
 
 
 def test_run_records_mcp_tool_calls(client: TestClient) -> None:

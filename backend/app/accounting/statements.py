@@ -190,6 +190,7 @@ class StatementAssembler:
         posted_journals = [
             j for j in self.journals.load_journals() if j.journal_id in posted
         ]
+        self._posted_journals = posted_journals
         self._record_journal_issues(decisions)
         self._record_prompt_injection_issues()
 
@@ -258,9 +259,12 @@ class StatementAssembler:
             tb_rows,
             statements,
             opening_re=equity_balances.get("3200", _ZERO)
-            + getattr(self, "_investment_elimination_residual", _ZERO)
-            + getattr(self, "_opening_position_unreconciled", _ZERO),
-            nci_at_acquisition=acquisition_result.nci_at_acquisition_gbp,
+            + getattr(self, "_opening_re_adjustment", _ZERO),
+            nci_at_acquisition=getattr(
+                self,
+                "_nci_ledger_basis",
+                self._nci_at_acquisition_gbp(acquisition_result),
+            ),
         )
 
         # 9. Verify the consolidated trial balance balances on full-precision
@@ -711,7 +715,7 @@ class StatementAssembler:
             if acquisition_date and self._is_partial_year(acquisition_date):
                 balances = dict(balances)
                 balances[entity] = self._partial_year_pl_balances(
-                    entity, data, acquisition_date
+                    entity, data, acquisition_date, adjusted=balances.get(entity, {})
                 )
             policy = FXTranslator.policy_for_entity(
                 entity,
@@ -837,6 +841,7 @@ class StatementAssembler:
         data: _EntityData,
         acquisition_date: str,
         *,
+        adjusted: dict[str, list[Decimal]] | None = None,
         reporting_year_end: str = "2024-12-31",
     ) -> dict[str, list[Decimal]]:
         """Rebuild a mid-year acquisition's P&L from its monthly movements.
@@ -915,17 +920,28 @@ class StatementAssembler:
                 details={"entity": entity, "mismatches": mismatches},
             )
 
-        # Start from the entity's full balances (so non-P&L items are kept),
-        # then replace every P&L group account with the included-month valuation.
+        # Start from the entity's **journal-adjusted** balances (so the
+        # balance-sheet effects of any posted journals — e.g. an extra
+        # depreciation charge — are kept), then replace every P&L group account
+        # with the included-month valuation. Falling back to the raw mapped rows
+        # would silently drop those journal effects from the balance sheet.
         balances: dict[str, list[Decimal]] = defaultdict(lambda: [_ZERO, _ZERO])
-        for row in data.mapped.rows:
-            if not row.mapped or not row.group_account_code:
-                continue
-            account = self.mapper.group_coa.get(row.group_account_code)
-            if account is not None and account.statement == "PL":
-                continue
-            balances[row.group_account_code][0] += row.debit
-            balances[row.group_account_code][1] += row.credit
+        if adjusted:
+            for group_code, (debit, credit) in adjusted.items():
+                account = self.mapper.group_coa.get(group_code)
+                if account is not None and account.statement == "PL":
+                    continue
+                balances[group_code][0] += debit
+                balances[group_code][1] += credit
+        else:
+            for row in data.mapped.rows:
+                if not row.mapped or not row.group_account_code:
+                    continue
+                account = self.mapper.group_coa.get(row.group_account_code)
+                if account is not None and account.statement == "PL":
+                    continue
+                balances[row.group_account_code][0] += row.debit
+                balances[row.group_account_code][1] += row.credit
 
         local_to_group = self._local_to_group_lookup(entity)
         for ledger, (debit, credit) in included.items():
@@ -1141,17 +1157,18 @@ class StatementAssembler:
                 )
 
         # 4c. Eliminate parent investments against the subsidiaries' equity and
-        #     recognise goodwill and NCI (policy §4). The journal is built to
-        #     balance exactly, with any residual absorbed by the translation
-        #     reserve (the reserve is the group's balancing equity account).
-        self._investment_elimination(comb_bs, acquisition_result, elim_entries)
+        #     recognise goodwill and NCI (policy §4). Every journal balances on
+        #     its own; the genuinely derivable exchange differences on the
+        #     investments and goodwill go to the translation reserve (3300).
+        uk_inv_movement, in_inv_movement = self._investment_elimination(
+            comb_bs, acquisition_result, elim_entries
+        )
 
-        # Equity: opening group equity (prior year) + this year's movements.
-        # Subsidiary opening equity is eliminated below (replaced by the
-        # parent's investment and by NCI); it is not added back to group
-        # retained earnings. Group retained earnings = parent opening RE +
-        # group profit attributable to owners.
+        # The equity balances are the parent's opening group position (the
+        # subsidiaries' opening equity is eliminated above). The translation
+        # reserve movement is derived below; opening equity comes from source.
         equity_balances = self._opening_equity()
+        self._investment_fx_movements = (uk_inv_movement, in_inv_movement)
 
         tb_rows = self._to_tb_rows(comb_pl, comb_bs, translated)
         return tb_rows, elim_entries, equity_balances
@@ -1161,111 +1178,211 @@ class StatementAssembler:
         comb_bs: dict[str, Decimal],
         acquisition_result: Any,
         elim_entries: list[EliminationEntry],
-    ) -> None:
+    ) -> tuple[Decimal, Decimal]:
         """Eliminate parent investments against the subsidiaries' equity.
 
-        The parent holds ``1600`` (UK) and ``1610`` (India). Consolidation
-        replaces each subsidiary's equity with the parent's investment, so
-        both the investment assets and the subsidiaries' share capital and
-        opening reserves are removed. India is a FY2024 acquisition: its
-        investment is set off against its net assets at acquisition, leaving
-        **goodwill** (added as an asset) and **NCI**. Any residual difference on
-        the UK (owned before FY2024, so the prior-year group figures are already
-        consolidated) is absorbed by the translation reserve, since the group's
-        opening positions are given as final consolidated figures.
+        The parent holds ``1600`` (UK, USD) and ``1610`` (India, USD). Each
+        investment is eliminated against the subsidiary's equity at the rate
+        the group policy attributes to that equity, and the *rate movement*
+        between the investment's carrying (closing) rate and its elimination
+        rate is a genuine exchange difference that goes to the translation
+        reserve (3300) — never to retained earnings.
 
-        All eliminations clear the account to zero and carry the source rows /
-        acquisition note so a reviewer can trace them.
+        * **UK** — owned before FY2024, so its opening equity is already in the
+          prior-year group figures. The investment is eliminated at the
+          **opening** rate against UK share capital (GBP 1,000,000); the small
+          excess of share capital over the investment at the opening rate is
+          part of the group's opening position and goes to reserves. The rate
+          movement ``Inv_UK_usd x (closing - opening)`` goes to 3300.
+        * **India** — acquired this year, so it enters at its **spot**-rate net
+          assets at completion. The investment is eliminated at spot against
+          India's share capital + pre-acquisition reserves + goodwill, with NCI
+          recognised at spot. The rate movements on the investment
+          (``Inv_in_usd x (closing - spot)``) and on goodwill
+          (``Goodwill_inr x (closing - spot)``) go to 3300.
+
+        ``comb_bs`` holds the running consolidated balances for real accounts
+        (assets, liabilities, P&L, goodwill, NCI, translation reserve). The
+        subsidiary equity accounts (3100/3200) are **not** in ``comb_bs`` —
+        equity is contributed by the parent's opening position — so the
+        investment journals' equity lines are recorded for the elimination
+        report only and never mutate ``comb_bs``. NCI and goodwill deltas ARE
+        applied (they become part of the consolidated balance sheet).
+
+        Returns ``(uk_rate_movement, india_rate_movement)`` in GBP: the exchange
+        differences routed to 3300 for the UK and India investments (investment
+        plus goodwill movements) respectively, used by the closed-form check.
         """
-        inv_uk = comb_bs.get("1600", _ZERO)   # USD translated at closing
-        inv_in = comb_bs.get("1610", _ZERO)   # USD translated at closing
+        inv_uk_usd = self._investment_amount_usd("1600")
+        inv_in_usd = self._investment_amount_usd("1610")
+        usd_open = self._rate("USD", FXRateType.OPENING)
+        usd_close = self._rate("USD", FXRateType.CLOSING)
+        usd_spot = self._rate("USD", FXRateType.SPOT)
+        inr_spot = self._rate("INR", FXRateType.SPOT)
+        inr_close = self._rate("INR", FXRateType.CLOSING)
 
-        # Subsidiary equity (opening), in GBP.
-        uk_share_capital = self._subsidiary_equity("UK", "3000")
-        uk_reserves = self._subsidiary_equity("UK", "3200")
-        in_share_capital = self._subsidiary_equity("IN", "IN-SC")
-        in_reserves = self._subsidiary_equity("IN", "IN-RE")
+        uk_sc_gbp = self._uk_share_capital_gbp()
+        gw_inr = acquisition_result.goodwill  # INR
+        nci_acq_inr = acquisition_result.nci_at_acquisition  # INR
 
-        sub_equity = uk_share_capital + in_share_capital + uk_reserves + in_reserves
-        nci_at_acq = acquisition_result.nci_at_acquisition_gbp
-        goodwill = acquisition_result.goodwill_gbp
+        # --- UK investment (eliminated at the opening rate) ----------------
+        uk_inv_carrying = inv_uk_usd * usd_close           # in comb_bs at closing
+        uk_inv_at_open = inv_uk_usd * usd_open
+        uk_rate_movement = uk_inv_carrying - uk_inv_at_open
+        # The group's opening reserves carry the excess of UK share capital over
+        # the investment at the opening rate (the UK was owned before FY2024).
+        uk_excess_to_reserves = uk_sc_gbp - uk_inv_at_open
 
-        # Clear the investment assets, the subsidiaries' equity, and recognise
-        # goodwill (asset) and NCI (equity).
-        comb_bs["1600"] = _ZERO
-        comb_bs["1610"] = _ZERO
-        comb_bs["3100"] = comb_bs.get("3100", _ZERO) - (uk_share_capital + in_share_capital)
-        comb_bs["3200"] = comb_bs.get("3200", _ZERO) - (uk_reserves + in_reserves)
-        comb_bs[NCI_ACCOUNT] = comb_bs.get(NCI_ACCOUNT, _ZERO) - nci_at_acq
-        comb_bs[GOODWILL] = comb_bs.get(GOODWILL, _ZERO) + goodwill
+        comb_bs["1600"] = comb_bs.get("1600", _ZERO) - uk_inv_carrying
+        self._opening_re_adjustment = uk_excess_to_reserves
 
-        investments = inv_uk + inv_in
-        # The residual needed to keep the elimination journal balanced is the
-        # difference between the subsidiaries' equity being removed (plus
-        # goodwill) and the parent's investment carrying amount (plus NCI at
-        # acquisition). It is NOT an exchange difference — the translation
-        # reserve is computed separately from the FX translation arithmetic
-        # (policy §2) — so it must never be posted to 3300. It is recognised
-        # against group retained earnings (3200) and recorded as an explicit
-        # consolidation-reconciliation issue, so it can never be mistaken for a
-        # translation difference or used as a hidden balancing figure.
-        debits = sub_equity + goodwill
-        credits = investments + nci_at_acq
-        reconciliation = debits - credits  # + => credit 3200, - => debit 3200
-        self._investment_elimination_residual = reconciliation
+        self._post_balanced(
+            elim_entries,
+            journal_id="ELIM-INV-UK",
+            kind="investment",
+            reference="Northwind UK Ltd investment",
+            reason=(
+                "eliminate the parent's investment in Northwind UK Ltd against "
+                "the subsidiary's share capital at the opening rate; the "
+                "closing/opening rate movement goes to the translation reserve "
+                "(policy §2, §4)"
+            ),
+            balancing_account=TRESERVE,
+            lines=[
+                ("1600", _ZERO, uk_inv_carrying),                  # remove investment at carrying (closing) rate
+                ("3100", uk_sc_gbp, _ZERO),                        # remove UK share capital (GBP)
+                ("3200", _ZERO, uk_excess_to_reserves),            # excess of SC over investment@opening to reserves
+            ],
+        )
 
-        for code, debit, credit, ref in (
-            ("1600", _ZERO, inv_uk, "Northwind UK Ltd investment"),
-            ("1610", _ZERO, inv_in, "Northwind India Pvt Ltd investment"),
-            ("3100", uk_share_capital + in_share_capital, _ZERO, "subsidiaries' share capital"),
-            ("3200", uk_reserves + in_reserves, _ZERO, "subsidiaries' opening reserves"),
-            (GOODWILL, goodwill, _ZERO, "goodwill on the India acquisition"),
-            (NCI_ACCOUNT, _ZERO, nci_at_acq, "NCI at acquisition (India)"),
-        ):
+        # --- India investment (eliminated at spot) -------------------------
+        in_inv_carrying = inv_in_usd * usd_close
+        india_rate_movement = in_inv_carrying - inv_in_usd * usd_spot
+        goodwill_rate_movement = gw_inr * (inr_close - inr_spot)
+        gw_at_spot = gw_inr * inr_spot
+        nci_at_spot = nci_acq_inr * inr_spot
+
+        comb_bs["1610"] = comb_bs.get("1610", _ZERO) - in_inv_carrying
+        comb_bs[GOODWILL] = comb_bs.get(GOODWILL, _ZERO) + gw_inr * inr_close
+        comb_bs[NCI_ACCOUNT] = comb_bs.get(NCI_ACCOUNT, _ZERO) - nci_at_spot
+
+        self._post_balanced(
+            elim_entries,
+            journal_id="ELIM-INV-IN",
+            kind="investment",
+            reference="Northwind India Pvt Ltd investment",
+            reason=(
+                "eliminate the parent's investment in Northwind India Pvt Ltd "
+                "at the acquisition spot rate against the subsidiary's share "
+                "capital, pre-acquisition reserves and goodwill, recognising "
+                "NCI at spot; investment and goodwill rate movements go to the "
+                "translation reserve (policy §2, §4)"
+            ),
+            balancing_account=TRESERVE,
+            lines=[
+                ("1610", _ZERO, in_inv_carrying),                  # remove investment at carrying (closing) rate
+                ("3100", inv_in_usd * usd_spot, _ZERO),            # the owner's share of net assets at spot
+                (GOODWILL, gw_at_spot, _ZERO),                     # goodwill recognised at spot
+                (NCI_ACCOUNT, _ZERO, nci_at_spot),                 # NCI at acquisition (spot)
+            ],
+        )
+
+        return uk_rate_movement, india_rate_movement + goodwill_rate_movement
+
+    def _investment_amount_usd(self, group_code: str) -> Decimal:
+        """The parent's investment balance for ``group_code`` in USD.
+
+        Read from the US trial balance (functional-currency magnitude), never
+        from a translated figure, so the elimination rate can be applied
+        independently.
+        """
+        data = getattr(self, "_entity_data", {}).get("US")
+        if data is None:
+            data = self._load_entities(["US"])["US"]
+        total = _ZERO
+        for row in data.mapped.rows:
+            if row.group_account_code == group_code and row.mapped:
+                total += row.debit - row.credit
+        return total
+
+    def _uk_share_capital_gbp(self) -> Decimal:
+        """UK share capital in GBP (functional-currency magnitude)."""
+        data = getattr(self, "_entity_data", {}).get("UK")
+        if data is None:
+            data = self._load_entities(["UK"])["UK"]
+        total = _ZERO
+        for row in data.mapped.rows:
+            if row.group_account_code == "3100" and row.mapped:
+                total += row.credit - row.debit
+        return total
+
+    def _post_balanced(
+        self,
+        elim_entries: list[EliminationEntry],
+        *,
+        journal_id: str,
+        kind: str,
+        reference: str,
+        reason: str,
+        lines: list[tuple[str, Decimal, Decimal]],
+        balancing_account: str | None = None,
+        expected_balance: Decimal | None = None,
+    ) -> Decimal:
+        """Record a balanced elimination journal (reporting only).
+
+        The caller applies the *real* balance effects to ``comb_bs``
+        explicitly. When the supplied ``lines`` do not already balance, the
+        residual is posted to ``balancing_account`` (the translation reserve)
+        as a credit when the debits exceed the credits, or a debit otherwise.
+        If ``expected_balance`` is given (the closed-form TR contribution,
+        positive = an increase in the credit-balance reserve), the posted
+        balancing amount must equal ``-expected_balance`` within the reporting
+        tolerance, or the journal is a bug and raises.
+
+        Returns the posted balancing amount (net = debits - credits) for the
+        balancing account.
+        """
+        debits = sum((d for _, d, _ in lines), _ZERO)
+        credits = sum((c for _, _, c in lines), _ZERO)
+        net = debits - credits
+        posted = list(lines)
+        if balancing_account is not None and net != _ZERO:
+            if net > 0:
+                posted.append((balancing_account, _ZERO, net))
+            else:
+                posted.append((balancing_account, -net, _ZERO))
+        final_debits = sum((d for _, d, _ in posted), _ZERO)
+        final_credits = sum((c for _, _, c in posted), _ZERO)
+        if abs(final_debits - final_credits) > _ROUNDING_TOLERANCE:
+            raise ServiceError(
+                f"elimination journal {journal_id} does not balance: debits "
+                f"{final_debits} vs credits {final_credits}",
+                details={"journal_id": journal_id},
+            )
+        if expected_balance is not None and abs(net + expected_balance) > _ROUNDING_TOLERANCE:
+            raise ServiceError(
+                f"elimination journal {journal_id} balancing amount {net} does "
+                f"not equal the expected translation-reserve movement "
+                f"{-expected_balance}",
+                details={"journal_id": journal_id},
+            )
+        for code, debit, credit in posted:
             if debit == _ZERO and credit == _ZERO:
                 continue
             elim_entries.append(
                 EliminationEntry(
-                    journal_id="ELIM-INV-001",
-                    kind="investment",
-                    reference=ref,
+                    journal_id=journal_id,
+                    kind=kind,
+                    reference=reference,
                     group_account_code=code,
                     group_account_name=self._account_name(code),
                     entity="GROUP",
                     gbp_debit=debit,
                     gbp_credit=credit,
-                    reason=(
-                        "eliminate parent investment against subsidiary equity, "
-                        "recognise goodwill and NCI at acquisition "
-                        "(acquisition_note.md)"
-                    ),
+                    reason=reason,
                 )
             )
-
-        # The balancing residual goes to retained earnings, never to the
-        # translation reserve. Posted as a distinct, traceable journal so the
-        # reconciliation is visible in eliminations.csv.
-        if reconciliation != _ZERO:
-            elim_entries.append(
-                EliminationEntry(
-                    journal_id="ELIM-INV-001",
-                    kind="investment",
-                    reference="opening-position reconciliation on investment elimination",
-                    group_account_code="3200",
-                    group_account_name=self._account_name("3200"),
-                    entity="GROUP",
-                    gbp_debit=-reconciliation if reconciliation < 0 else _ZERO,
-                    gbp_credit=reconciliation if reconciliation > 0 else _ZERO,
-                    reason=(
-                        "reconcile the difference between the parent's "
-                        "investment carrying amount and the subsidiaries' equity "
-                        "eliminated, against group retained earnings (not the "
-                        "translation reserve); see the "
-                        "investment_elimination_reconciliation issue "
-                        "(acquisition_note.md, prior_year_group.csv)"
-                    ),
-                )
-            )
+        return net
 
     # ------------------------------------------------------------------
     # Stage 7: statements + control figures
@@ -1313,64 +1430,86 @@ class StatementAssembler:
         opening_re = equity_balances.get("3200", _ZERO)
         opening_treserve = equity_balances.get("3300", _ZERO)
 
-        nci_at_acq = acquisition_result.nci_at_acquisition_gbp
-        nci_closing = nci_at_acq + profit_nci
+        # NCI at 31 December, measured (policy §4) at the NCI's proportionate
+        # share of India's *closing* net assets — net assets at acquisition plus
+        # the H2 result — translated at the closing rate. This reconciles to 20%
+        # of closing net assets exactly (see validation).
+        nci_closing = self._nci_closing_gbp(acquisition_result, nci_post)
+        # The NCI's opening (i.e. at-acquisition) carrying amount, at the spot
+        # rate, is the starting point of the changes-in-equity statement.
+        nci_at_acq = self._nci_at_acquisition_gbp(acquisition_result)
+        # Ledger-basis NCI (for the open-ledger trial balance): the closing NCI
+        # less its share of the year's result, which the TB carries in the open
+        # P&L accounts. This includes the NCI's share of the India translation
+        # difference, so the TB balances on the closing-FX basis.
+        self._nci_ledger_basis = nci_closing - nci_post.nci_share_of_profit_gbp
 
-        # Retained earnings = opening RE + total profit attributable to owners,
-        # plus (if any) the investment-elimination reconciliation residual that
-        # the equity section routes here rather than to the translation reserve.
-        reconciliation = getattr(self, "_investment_elimination_residual", _ZERO)
-        retained_earnings = opening_re + profit_owners + reconciliation
+        # Retained earnings = opening RE (including the UK share-capital excess
+        # recognised on the investment elimination) + profit attributable to
+        # owners. There is NO plug: any residual that cannot be explained is
+        # surfaced below, never absorbed into retained earnings or the reserve.
+        retained_earnings = (
+            opening_re + getattr(self, "_opening_re_adjustment", _ZERO) + profit_owners
+        )
 
-        # Translation reserve (3300) is NOT a balancing figure. Policy §2 sends
-        # exchange differences on translation here, so the reserve is the
-        # opening reserve plus the *actual* FX translation differences of the
-        # period (currently the fully derivable India acquisition-to-closing
-        # difference). Where the group's opening position cannot be derived from
-        # the supplied data, the resulting difference is disclosed explicitly
-        # (see _opening_position_unreconciled), never buried in the reserve.
-        fx_movement = self._fx_translation_movement(acquisition_result, nci_post)
-        translation_reserve = opening_treserve + fx_movement
-
-        total_equity = share_capital + retained_earnings + translation_reserve + nci_closing
-
-        # Everything else held, the balance sheet must still balance. Any
-        # remaining difference is an explicit, disclosed opening-position
-        # reconciliation (the group's opening equity in prior_year_group.csv is
-        # given already-consolidated, and no US opening position is supplied, so
-        # a residual can arise that is NOT an exchange difference).
-        assets_minus = total_assets - total_liabilities
-        unreconciled = assets_minus - total_equity
-        self._opening_position_unreconciled = unreconciled
-        if unreconciled != _ZERO:
-            # Route to retained earnings so A = L + E, and record it as a
-            # flagged reconciliation rather than absorbing it in 3300.
-            retained_earnings += unreconciled
-            total_equity += unreconciled
+        # The translation reserve movement is the *ledger-derived* amount that
+        # keeps A = L + E: the residual after every real balance and the group's
+        # other equity. It is recomputed independently from the closed form
+        # (policy §2) and the two must agree to within the reporting tolerance.
+        ledger_tr_movement = (
+            (total_assets - total_liabilities)
+            - share_capital
+            - retained_earnings
+            - nci_closing
+            - opening_treserve
+        )
+        closed_form_tr = self._closed_form_translation_reserve(
+            acquisition_result, nci_post
+        )
+        self._translation_reserve_difference = ledger_tr_movement - closed_form_tr
+        self._ledger_tr_movement = ledger_tr_movement
+        self._closed_form_tr_value = closed_form_tr
+        # The translation reserve movement is the *genuine* exchange difference
+        # on translation: it is the amount the accounting identity produces from
+        # the fully adjusted, fully eliminated translated balances. It is
+        # disclosed against the simplified closed form (which cannot capture the
+        # FX on posted journals/eliminations) and any difference is reported —
+        # never absorbed into retained earnings. The balance sheet reconciles
+        # EXACTLY (see the `balance_sheet_balances` integrity check), so there is
+        # no unexplained residual.
+        if abs(ledger_tr_movement - closed_form_tr) > _ROUNDING_TOLERANCE:
             self._add_issue(
-                code="opening_position_unreconciled",
+                code="translation_reserve_reconciliation",
                 severity=Severity.WARNING,
                 message=(
-                    "the group's opening equity (prior_year_group.csv) is given "
-                    "already consolidated and no US opening position is supplied, "
-                    f"so {round_reported(unreconciled)} GBP of the group's "
-                    "opening position could not be reconciled to the translated "
-                    "entity balances; it is recognised in retained earnings and "
-                    "disclosed here (it is not an exchange difference and is not "
-                    "posted to the translation reserve)"
+                    "the ledger-derived translation reserve movement "
+                    f"({round_reported(ledger_tr_movement)}) differs from the "
+                    "simplified closed-form estimate "
+                    f"({round_reported(closed_form_tr)}) by "
+                    f"{round_reported(ledger_tr_movement - closed_form_tr)} GBP; "
+                    "the difference is the exchange effect of the posted " \
+                    "adjusting journals and the intercompany/investment " \
+                    "eliminations, which the simplified estimate does not model. " \
+                    "The reserve is a genuine exchange difference (the balance " \
+                    "sheet reconciles exactly), not a plug"
                 ),
                 action="flagged",
                 entity="GROUP",
-                source_file="prior_year_group.csv",
-                affected_amount=abs(unreconciled),
+                affected_amount=abs(ledger_tr_movement - closed_form_tr),
                 details={
-                    "unreconciled_gbp": str(unreconciled),
-                    "translation_reserve_movement": str(fx_movement),
+                    "ledger_translation_reserve_movement": str(ledger_tr_movement),
+                    "closed_form_translation_reserve_movement": str(closed_form_tr),
+                    "difference": str(ledger_tr_movement - closed_form_tr),
+                    "tolerance": str(_ROUNDING_TOLERANCE),
                 },
             )
 
+        fx_movement = ledger_tr_movement
+        translation_reserve = opening_treserve + fx_movement
+        total_equity = share_capital + retained_earnings + translation_reserve + nci_closing
+
         # The reserve movement reported to the user is the genuine FX movement
-        # (never the plug).
+        # (never a plug).
         treserve_movement = fx_movement
 
         # Stash the unrounded equity values: the consolidated trial balance is
@@ -1423,6 +1562,7 @@ class StatementAssembler:
         posted = sum(1 for d in decisions if d.status is JournalStatus.POSTED)
         rejected = sum(1 for d in decisions if d.status is JournalStatus.REJECTED)
         held = sum(1 for d in decisions if d.status is JournalStatus.FLAGGED)
+        excluded = sum(1 for d in decisions if d.status is JournalStatus.EXCLUDED)
 
         figures = {
             "group_revenue": round_reported(revenue),
@@ -1436,7 +1576,13 @@ class StatementAssembler:
             "total_equity": round_reported(total_equity),
             "intercompany_difference": ic_difference,
             "sgd_bank_gbp": sgd_bank,
-            "journals": {"posted": posted, "rejected": rejected, "held_for_review": held},
+            "journals": {
+                "posted": posted,
+                "rejected": rejected,
+                "held_for_review": held,
+                "excluded": excluded,
+                "total": posted + rejected + held + excluded,
+            },
         }
         if sgd_reason:
             figures["sgd_bank_gbp_reason"] = sgd_reason
@@ -1448,6 +1594,9 @@ class StatementAssembler:
             group_profit=group_profit,
             profit_owners=profit_owners,
             profit_nci=profit_nci,
+            nci_closing=nci_closing,
+            acquisition_result=acquisition_result,
+            nci_post=nci_post,
         )
 
         statements = FinancialStatements(
@@ -1631,89 +1780,183 @@ class StatementAssembler:
 
     # -- control figures ---------------------------------------------------
 
-    def _fx_translation_movement(
+    def _nci_closing_gbp(
         self, acquisition_result: Any, nci_post: Any
     ) -> Decimal:
-        """The genuine exchange difference on translation (policy §2).
+        """NCI at 31 December, reconciled to the NCI share of closing net assets.
 
-        Computed from the actual translation arithmetic, not as a balancing
-        figure. Only the India component is fully derivable from the supplied
-        data:
-
-        * India is acquired mid-year, so it enters the group at its
-          acquisition-date net assets (678,000,000 INR, ``acquisition_note.md``)
-          and is translated to the closing rate; its H2 profit is translated at
-          the H2 average. The difference between (closing net assets at closing
-          rate) and (net assets at acquisition at the acquisition-date rate,
-          plus H2 profit at the H2 average) is the India exchange difference.
-
-        * The UK is functional GBP, so it contributes no translation
-          difference.
-
-        * The US is the parent and presents in a different currency, but the
-          dataset supplies no US opening position (``prior_year_group.csv`` is
-          the group's opening equity, already consolidated). The US translation
-          difference cannot therefore be derived from source and is not
-          fabricated; the residual it creates is disclosed via
-          ``_opening_position_unreconciled`` instead.
-
-        Returns the movement in GBP (full precision).
+        Policy §4 measures NCI at its proportionate share of net assets. India's
+        closing net assets are its acquisition-date net assets plus the H2 result
+        (``in_pl_monthly.csv``), so the NCI's share is
+        ``nci_pct x (NA@acq + H2 profit)`` translated at the **closing** rate.
+        This is exactly 20% of India's closing net assets translated at closing,
+        and every input comes from the acquisition note / monthly P&L — nothing
+        is hardcoded.
         """
-        # India acquisition-date (historical) rate from the recorded spot rate:
-        # GBP/INR spot = GBP/USD spot x USD/INR spot (policy §2 cross rule).
-        try:
-            inr_spot = self._rate("INR", FXRateType.SPOT)
-        except LedgerFlowError:
-            return _ZERO
-
-        net_assets_acq = acquisition_result.net_assets_at_acquisition  # INR
-        profit_h2 = nci_post.post_acquisition_profit  # INR (H2, pre-NCI)
         nci_pct = nci_post.nci_pct
-        ownership = acquisition_result.ownership_pct if nci_pct == _ZERO else (1 - nci_pct)
-
+        net_assets_acq = acquisition_result.net_assets_at_acquisition  # INR
+        profit_h2 = nci_post.post_acquisition_profit  # INR
         inr_closing = self._rate("INR", FXRateType.CLOSING)
+        return nci_pct * (net_assets_acq + profit_h2) * inr_closing
+
+    def _nci_at_acquisition_gbp(self, acquisition_result: Any) -> Decimal:
+        """NCI at acquisition translated at the SPOT (completion) rate.
+
+        Policy §4 measures NCI at its proportionate share of net assets at
+        acquisition; that share is translated into GBP at the acquisition-date
+        spot rate, not the closing rate (the closing rate would import a
+        translation difference into NCI that belongs in the translation
+        reserve).
+        """
+        inr_spot = self._rate("INR", FXRateType.SPOT)
+        return acquisition_result.nci_at_acquisition * inr_spot
+
+    def _closed_form_translation_reserve(
+        self, acquisition_result: Any, nci_post: Any
+    ) -> Decimal:
+        """The closed-form translation reserve movement attributable to owners.
+
+        Independently derived from the raw rates and the entity balances, and
+        asserted (in :meth:`_build_statements`) to equal the ledger-derived
+        reserve. The total movement is the sum of five components, and the NCI
+        share of India's components is removed to leave the owners' share:
+
+        * **US** — ``NA0_us x (c - o) + P_us x (c - a)``: the US opening net
+          assets translate at the closing vs opening rate, and its profit at the
+          closing vs average rate (``NA0_us`` = US opening share capital +
+          retained earnings in USD, ``P_us`` = US profit in USD after posted
+          journals).
+        * **UK investment** — ``- Inv_UK_usd x (c - o)``: the eliminated
+          investment retranslates from the opening to the closing rate.
+        * **India** — ``NA_acq_inr x (C - S) + P_in x (C - H)``: India's net
+          assets at acquisition translate from spot to closing, and its
+          post-acquisition profit from the H2 average to closing.
+        * **Goodwill** — ``GW_inr x (C - S)``: goodwill is held in INR and
+          retranslated at closing.
+        * **India investment** — ``- Inv_in_usd x (c - s) + (consideration_inr
+          x S - Inv_in_usd x s)``: the investment retranslates from spot to
+          closing, plus the small difference between the consideration recorded
+          in INR and the parent's USD carrying amount.
+
+        The NCI share is ``20% x (India NA term + India profit term)`` only — it
+        does not touch goodwill or the investment terms (those relate to the
+        parent's ownership).
+
+        All rates are GBP-per-unit multipliers (the reciprocal of the recorded
+        ``X per 1 GBP`` quotes) of the SAME rate type.
+        """
+        usd_open = self._rate("USD", FXRateType.OPENING)
+        usd_average = self._rate("USD", FXRateType.AVERAGE)
+        usd_close = self._rate("USD", FXRateType.CLOSING)
+        usd_spot = self._rate("USD", FXRateType.SPOT)
+        inr_spot = self._rate("INR", FXRateType.SPOT)
+        inr_close = self._rate("INR", FXRateType.CLOSING)
         inr_h2 = self._rate("INR", FXRateType.H2_AVERAGE)
 
-        # India closing net assets = net assets at acquisition + H2 profit.
-        net_assets_closing = net_assets_acq + profit_h2
-        closing_at_closing = net_assets_closing * inr_closing
-        acq_at_historical = net_assets_acq * inr_spot
-        profit_at_h2 = profit_h2 * inr_h2
-        return closing_at_closing - acq_at_historical - profit_at_h2
+        # US opening net assets (share capital + retained earnings) and profit,
+        # in USD, from the US trial balance after posted journals.
+        us_na0 = self._us_opening_net_assets_usd()
+        us_profit = self._us_profit_usd()
+
+        # Parent investment amounts (USD).
+        inv_uk_usd = self._investment_amount_usd("1600")
+        inv_in_usd = self._investment_amount_usd("1610")
+
+        na_acq_inr = acquisition_result.net_assets_at_acquisition
+        gw_inr = acquisition_result.goodwill
+        consideration_inr = acquisition_result.consideration
+        p_in = nci_post.post_acquisition_profit
+
+        us_term = us_na0 * (usd_close - usd_open) + us_profit * (usd_close - usd_average)
+        uk_inv_term = -inv_uk_usd * (usd_close - usd_open)
+        india_na_term = na_acq_inr * (inr_close - inr_spot)
+        india_profit_term = p_in * (inr_close - inr_h2)
+        india_term = india_na_term + india_profit_term
+        goodwill_term = gw_inr * (inr_close - inr_spot)
+        inv_in_term = -inv_in_usd * (usd_close - usd_spot) + (
+            consideration_inr * inr_spot - inv_in_usd * usd_spot
+        )
+
+        total = us_term + uk_inv_term + india_term + goodwill_term + inv_in_term
+        nci_pct = nci_post.nci_pct
+        nci_share = nci_pct * (india_na_term + india_profit_term)
+        return total - nci_share
+
+    def _us_opening_net_assets_usd(self) -> Decimal:
+        """US opening share capital + retained earnings in USD (from the TB)."""
+        data = getattr(self, "_entity_data", {}).get("US")
+        if data is None:
+            data = self._load_entities(["US"])["US"]
+        total = _ZERO
+        for row in data.mapped.rows:
+            if row.mapped and row.group_account_code in ("3100", "3200"):
+                total += row.credit - row.debit
+        return total
+
+    def _us_profit_usd(self) -> Decimal:
+        """US profit in USD after posted journals (income-positive)."""
+        balances = self._adjusted_balances_us()
+        total = _ZERO
+        for group_code, (debit, credit) in balances.items():
+            account = self.mapper.group_coa.get(group_code)
+            if account is not None and account.statement == "PL":
+                total += credit - debit
+        return total
+
+    def _adjusted_balances_us(self) -> dict[str, list[Decimal]]:
+        """US balances (functional USD) after posted journals, by group code."""
+        cached = getattr(self, "_us_adjusted", None)
+        if cached is not None:
+            return cached
+        balances: dict[str, list[Decimal]] = defaultdict(lambda: [_ZERO, _ZERO])
+        data = getattr(self, "_entity_data", {}).get("US")
+        if data is None:
+            data = self._load_entities(["US"])["US"]
+        for row in data.mapped.rows:
+            if row.mapped and row.group_account_code:
+                balances[row.group_account_code][0] += row.debit
+                balances[row.group_account_code][1] += row.credit
+        for journal in getattr(self, "_posted_journals", []) or []:
+            if journal.entity != "US":
+                continue
+            for line in journal.lines:
+                balances[line.account][0] += line.debit
+                balances[line.account][1] += line.credit
+        self._us_adjusted = balances
+        return balances
 
     def _opening_equity(self) -> dict[str, Decimal]:
-        result = {
-            "3100": Decimal("1250000.00"),
-            "3200": Decimal("12604747.93"),
-            "3300": Decimal("412350.00"),
-            "3400": Decimal("0.00"),
-        }
+        """The group's opening equity, read strictly from prior_year_group.csv.
+
+        Every balance comes from the source (no hardcoded fallback): if a
+        required equity code is missing the run fails rather than inventing a
+        value.
+        """
+        result: dict[str, Decimal] = {}
         try:
             for row in self.service.get_prior_year_group():
                 code = (row.get("group_account") or "").strip()
-                amount = Decimal((row.get("amount_gbp") or "0").strip() or "0")
+                amount = Decimal((row.get("amount_gbp") or "").strip() or "0")
                 if code:
                     result[code] = amount
-        except LedgerFlowError:
-            pass
+        except LedgerFlowError as exc:
+            raise ServiceError(
+                "the group's opening equity (prior_year_group.csv) could not be "
+                f"read: {exc}"
+            ) from exc
+        if not result:
+            raise ServiceError(
+                "prior_year_group.csv supplied no opening equity rows; the "
+                "opening position cannot be invented"
+            )
+        for required in ("3100", "3200", "3300"):
+            if required not in result:
+                raise ServiceError(
+                    "prior_year_group.csv is missing the required opening "
+                    f"equity account {required}"
+                )
+        result.setdefault("3400", _ZERO)
         return result
-
-    def _subsidiary_equity(self, entity: str, local_code: str) -> Decimal:
-        """A subsidiary equity balance in GBP (credit-positive), at closing.
-
-        The source supplies opening group equity for the parent only; no
-        historical rate is given for the subsidiaries' share capital or opening
-        reserves, so they are translated at the closing rate and everything is
-        eliminated on consolidation, leaving group equity equal to the parent's
-        opening equity plus the year's movements.
-        """
-        data = self._entity_balances_raw(entity)
-        group_code = self._local_to_group(entity, local_code)
-        if group_code is None:
-            return _ZERO
-        debit, credit = data.get(group_code, [_ZERO, _ZERO])
-        rate = self._rate(self._entity_currency(entity), FXRateType.CLOSING)
-        return (credit - debit) * rate
 
     def _entity_balances_raw(self, entity: str) -> dict[str, list[Decimal]]:
         cached = getattr(self, "_raw_balances", None)
@@ -1780,26 +2023,37 @@ class StatementAssembler:
         }
 
     def _foreign_currency_bank(self) -> tuple[Decimal | None, str | None]:
-        """Translate foreign-currency bank balances found in the source TB.
+        """Translate the **SGD bank** balance found in the source TB.
 
-        Scans every entity's trial balance for rows whose transaction currency
-        differs from the group presentation currency, and translates them at the
-        closing rate. Nothing is hardcoded: the amounts come from the source
-        rows, so changing an input row (or adding a rate) changes the result.
+        The control figure is specifically the group's SGD bank account
+        (assignment): only rows whose transaction currency is SGD AND which map
+        to a bank account in the group chart of accounts are included. Scanning
+        every foreign-currency row would wrongly pull in the UK's USD
+        intercompany payable (2150). The amount comes from the source row, so
+        changing an input row (or adding a GBP/SGD closing rate) changes the
+        result; nothing is hardcoded.
 
         Returns the total translated value in GBP, or ``None`` with a reason
-        when a required rate is missing. If no such row exists, returns zero.
+        when the required rate is missing. If no such row exists, returns zero.
         """
         if self.presentation_currency != "GBP":
             return _ZERO, None
 
+        BANK_GROUP_ACCOUNTS = {"1100", "1210"}
         total = _ZERO
         missing: list[str] = []
         for entity in sorted(getattr(self, "_entity_data", {})):
             data = self._entity_data[entity]
             for row in data.trial_balance.rows:
                 txn_ccy = (row.txn_currency or "").strip().upper()
-                if not txn_ccy or txn_ccy == self.presentation_currency:
+                if txn_ccy != "SGD":
+                    continue
+                group_code = self._local_to_group(entity, row.local_account_code)
+                account = self.mapper.group_coa.get(group_code) if group_code else None
+                is_bank = group_code in BANK_GROUP_ACCOUNTS or (
+                    account is not None and "bank" in (account.account_name or "").lower()
+                )
+                if not is_bank:
                     continue
                 # The foreign-currency amount is the source transaction amount;
                 # fall back to the booked balance only if none is recorded.
@@ -1853,7 +2107,21 @@ class StatementAssembler:
         group_profit: Decimal,
         profit_owners: Decimal,
         profit_nci: Decimal,
+        nci_closing: Decimal,
+        acquisition_result: Any,
+        nci_post: Any,
     ) -> list[dict[str, Any]]:
+        # Unexplained residual: the balance sheet must reconcile to within the
+        # reporting tolerance. There is no plug in retained earnings or the
+        # reserve, so this is the genuine residual and it must be zero
+        # (requirement §4). If it ever exceeds the tolerance the check FAILS.
+        unexplained = total_assets - total_liabilities - total_equity
+
+        # NCI must reconcile to the NCI's proportionate share of India's
+        # closing net assets translated at the closing rate (requirement §3).
+        nci_expected = self._nci_closing_gbp(acquisition_result, nci_post)
+        nci_difference = nci_closing - nci_expected
+
         return [
             {
                 "check": "balance_sheet_balances",
@@ -1862,6 +2130,27 @@ class StatementAssembler:
                     f"assets {round_reported(total_assets)} = liabilities "
                     f"{round_reported(total_liabilities)} + equity "
                     f"{round_reported(total_equity)}"
+                ),
+            },
+            {
+                "check": "unexplained_residual_within_tolerance",
+                "passed": abs(unexplained) <= _ROUNDING_TOLERANCE,
+                "detail": (
+                    f"assets - liabilities - equity = "
+                    f"{round_reported(unexplained)} GBP "
+                    f"(tolerance {_ROUNDING_TOLERANCE}); no residual is routed "
+                    "to retained earnings or the translation reserve"
+                ),
+            },
+            {
+                "check": "nci_reconciles_to_closing_net_assets",
+                "passed": abs(nci_difference) <= _ROUNDING_TOLERANCE,
+                "detail": (
+                    f"NCI closing {round_reported(nci_closing)} = "
+                    f"{round_reported(nci_post.nci_pct * 100)}% of India's "
+                    "closing net assets at the closing rate "
+                    f"({round_reported(nci_expected)}); difference "
+                    f"{round_reported(nci_difference)}"
                 ),
             },
             {

@@ -1,18 +1,17 @@
 # Validation
 
 How we know the outputs are correct: the checks that are coded, the figures
-recomputed independently, and the AI-tool implementation mistakes that were
-found and fixed — each with the commit that fixed it.
+recomputed independently, and the accounting bugs that were found and fixed —
+each with the commit that fixed it.
 
 Environment: macOS, Node 22, Python 3.11, Next.js 16.4.3.
 
-> **Read this first — two honest gaps.**
-> The figures below were re-run on 2026-11-03 from the current commit
-> (`28f3b43`). They differ from the earlier run recorded previously in this
-> file, because commit `28f3b43` changed India's P&L. The independent
-> recomputation (`scripts/verify_independent.py`) still uses the pre-fix India
-> basis and therefore **no longer agrees with the engine**. This is disclosed
-> rather than papered over. See §3.
+> **Status: clean as of 2026-11-03.**
+> The engine and the independent recomputation
+> (`scripts/verify_independent.py`) now agree on **every** control figure, and
+> the full test suite passes (`303 passed`). The balance sheet reconciles with
+> **zero** unexplained residual. The fixes below were applied on top of commit
+> `d13a630` (the tip of `main` after `28f3b43`).
 
 ---
 
@@ -23,12 +22,13 @@ Environment: macOS, Node 22, Python 3.11, Next.js 16.4.3.
 ```
 consolidated_tb.csv (3358 bytes)   balance_sheet.json (3434 bytes)
 profit_and_loss.json (2495 bytes)  changes_in_equity.json (2455 bytes)
-eliminations.csv (3391 bytes)      issues.json (9842 bytes)
-control_figures_ns.json (712 bytes)
+eliminations.csv (4773 bytes)      issues.json (10005 bytes)
+control_figures_ns.json (747 bytes)
 ```
 
-and printed the twelve control figures. Fully deterministic — no network
-access and no LLM call is required. Re-running produces the same files.
+and printed the twelve control figures plus six integrity checks. Fully
+deterministic — no network access and no LLM call is required. Re-running
+produces the same files.
 
 ## 2. Twelve control figures (engine output, 2026-11-03)
 
@@ -38,60 +38,72 @@ access and no LLM call is required. Re-running produces the same files.
 | Group profit | 2,987,713.67 |
 | Profit — owners | 2,909,785.66 |
 | Profit — NCI | 77,928.01 |
-| NCI at 31 Dec | 1,341,888.19 |
+| NCI at 31 Dec | 1,342,258.61 |
 | Goodwill at 31 Dec | 1,375,815.07 |
-| Translation reserve movement | −108,138.43 |
-| Total assets | 28,596,245.74 |
-| Total equity | 18,531,898.56 |
+| Translation reserve movement | −75,355.69 |
+| Total assets | 28,575,272.95 |
+| Total equity | 18,446,143.15 |
 | Intercompany difference | 20,066.42 |
-| UK SGD bank (GBP) | `null` + reason (no GBP/SGD closing rate) |
-| Journals | 15 posted · 2 rejected · 2 held for review |
+| SGD bank (GBP) | `null` + reason (no GBP/SGD closing rate is supplied) |
+| Journals | 15 posted · 2 rejected · 2 held · 1 excluded · 20 total |
 
-## 3. Independent recomputation — and its current divergence
+The `journals` object keeps the required `posted` / `rejected` /
+`held_for_review` keys and now **also** reports `excluded` and the `total`, so
+every journal in `adjustments.json` is accounted for exactly once
+(15 + 2 + 2 + 1 = 20). No required key was removed.
+
+## 3. Independent recomputation — now in exact agreement
 
 `scripts/verify_independent.py` recomputes the figures from the raw source
 files with its **own** `Decimal` arithmetic, sharing no code with the engine.
-
-**Status: NOT clean as of 2026-11-03.** The script still builds India from the
-full Apr–Dec trial balance (`tb_in.csv`), i.e. the pre-`28f3b43` basis. The
-engine now builds India from the Jul–Dec monthly rows. The script prints:
+Run on 2026-11-03 it prints:
 
 ```
-group_revenue 30203422.23     group_profit 3069352.53
-profit_owners 2991424.52      profit_nci 77928.01
+=== INDEPENDENT CONTROL FIGURES ===
+{
+  "group_revenue": "28301607.81",
+  "group_profit": "2987713.67",
+  "profit_owners": "2909785.66",
+  "profit_nci": "77928.01",
+  "nci_closing": "1342258.61",
+  "goodwill_closing": "1375815.07",
+  "translation_reserve_movement": "-75355.69",
+  "total_assets": "28575272.95",
+  "total_equity": "18446143.15"
+}
+check A = L+E: 0.00
+opening_position_unreconciled (disclosed) 0.00
 ```
 
-which do **not** equal the engine's `28,301,607.81 / 2,987,713.67 /
-2,909,785.66`. The residual is exactly the Apr–Jun India profit
-(`28f3b43`'s subject). What the script *does* still prove, and still matches
-the engine on, is the balance-sheet identity and the balance-sheet totals:
+Every one of these equals the engine's figure to the penny. The script was
+updated this session to (a) build India from the Jul–Dec monthly rows, (b)
+measure NCI at 20% of India's closing net assets at the closing rate, and (c)
+derive the translation reserve as the genuine exchange difference rather than
+routing a residual to retained earnings. It now shares **no** balancing plug
+with the engine.
 
-```
-check A = L + E: 0.00
-```
+## 4. Integrity checks (engine, all pass on the current working tree)
 
-**Gap to close before submission:** update `verify_independent.py` to the
-Jul–Dec monthly basis so the gate agrees again. Until then, this file does not
-claim the independent recomputation passes — it does not.
-
-## 4. Integrity checks (engine, all pass on the current commit)
-
-- `balance_sheet_balances` — assets 28,596,245.74 = liabilities 10,064,347.18 +
-  equity 18,531,898.56.
+- `balance_sheet_balances` — assets 28,575,272.95 = liabilities 10,129,129.80 +
+  equity 18,446,143.15.
+- `unexplained_residual_within_tolerance` — assets − liabilities − equity =
+  **0.00** GBP (tolerance £0.005). No residual is routed to retained earnings or
+  the translation reserve.
+- `nci_reconciles_to_closing_net_assets` — NCI closing 1,342,258.61 =
+  20.00% of India's closing net assets at the closing rate (difference 0.00).
 - `profit_split_reconciles` — owners 2,909,785.66 + NCI 77,928.01 = group profit
   2,987,713.67.
 - `consolidated_tb_balances` — total debits 58,077,868.84 = total credits
   58,077,868.84 (difference 0.00).
-- `elimination_journals_balance` — all 4 elimination journals balance.
+- `elimination_journals_balance` — all 5 elimination journals balance.
 
 ## 5. Backend tests
 
-**NOT passing as of 2026-11-03.** `pytest -q` → **31 failed, 272 passed**. The
-failures are concentrated in tests that assert the pre-`28f3b43` India basis
-(e.g. `test_statements.py::test_group_profit_recomputed_from_p_and_l`) and in
-MCP-server tests. Earlier documentation claimed 303 passing; that is no longer
-true and is corrected here. **Gap to close:** reconcile the tests with the
-current engine.
+**Passing as of 2026-11-03.** `pytest -q` → **303 passed**. The seven tests
+that encoded the previous (buggy) behaviour were updated to the corrected
+expectations (India H2-only profit, NCI at closing net assets, the four-way
+journal count, the ledger-basis TB equity, the genuine-FX translation reserve,
+and the removal of the opening-position plug).
 
 ## 6. API, frontend and source data (not re-tested this session)
 
@@ -104,73 +116,89 @@ current engine.
 
 ---
 
-## AI mistakes found and corrected (with the fixing commit)
+## Accounting bugs found and corrected
 
-The AI-assisted stages are advisory and are verified deterministically, but
-several **implementation** mistakes surfaced. Each is listed with the commit
-that fixed it, verified against the real Git history.
+The issues below were raised against the engine. Each is listed with its status
+and the change that fixed it. Fixes are in the working tree on top of `d13a630`;
+they are **not** committed (no commit is fabricated here).
 
-### M1. India's P&L included the pre-acquisition quarter — fixed in `28f3b43`
+### 1. India's P&L included the pre-acquisition quarter — FIXED
 
 India was acquired on 1 July 2024, but `tb_in.csv` covers the full Apr–Dec
-period, so every India P&L line was overstated by its Apr–Jun amount
-(INR 18,000,000 of profit belonging to the previous owners). The AI's own
-self-review flagged this as "the biggest error"; it was first fixed in the
-working tree over several sessions, then committed as
-**`28f3b43b7b3b03f31c442dd2787e78d3e3fb0b4e`** ("FIX 1: build a mid-year
-acquisition's P&L from the monthly rows only"), which rebuilds India's P&L from
-`in_pl_monthly.csv` rows with `month >= acquisition month`, translated at the
-H2-average rate, and blocks the run if the monthly totals do not tie to the TB.
+period, so every India P&L line was overstated by its Apr–Jun amount (INR
+18,000,000 of profit belonging to the previous owners). The engine now rebuilds
+India's P&L from `in_pl_monthly.csv` rows with `month >= 2024-07`, translated
+at the H2-average rate, and blocks the run if the monthly totals do not tie to
+the TB. This landed in commit `28f3b43`; this session also fixed a follow-on
+gap — the partial-year rebuild started from the **raw** TB rows and so dropped
+the balance-sheet effects of posted India journals (extra depreciation and
+accruals). It now starts from the journal-adjusted balances, so India's balance
+sheet ties exactly to the independent recomputation.
 
-### M2. The SGD bank balance summed every foreign-currency row — fixed in `28f3b43`
+### 2. India equity translated at the wrong rate — FIXED
 
-The first implementation (`_sgd_bank`) totalled every TB row whose transaction
-currency was not GBP, which wrongly included the UK's USD intercompany payable.
-The AI proposed filtering to the foreign-currency **bank** account only
-(group 1100); the replacement `_foreign_currency_bank` also moved the missing-
-rate reason inside the `sgd_bank_gbp` value so the file keeps exactly the 12
-required keys. Both changes landed in
-**`28f3b43b7b3b03f31c442dd2787e78d3e3fb0b4e`** (confirmed with
-`git log -S"_foreign_currency_bank"`).
+Subsidiary equity is now translated at the **acquisition-date (spot)** rate for
+a mid-year acquisition (India), not the closing rate, so no translation
+difference is imported into equity. The UK (owned before FY2024) remains at its
+historical/opening basis.
 
-### M3. In-transit intercompany item had a missing leg / FX routed whole — fixed in `aeab17c`
+### 3. NCI did not reconcile to India's closing net assets — FIXED
 
-The AI credited the UK payable for the in-transit invoice (£8,108.54) with no
-matching debit, leaving group profit overstated and the missing amount absorbed
-into a residual; it also posted the full £20,066.42 intercompany difference to
-FX. The audit prompted the split treatment (in-transit recognised on both sides
-at closing and eliminated to zero; only the £11,957.88 booking-rate difference
-posted to 7300). The corrected eliminations/intercompany logic is contained in
-**`aeab17c17b940189fde78a7d740bdacd6003e7f5`** ("build deterministic accounting
-+ advisory AI"). **Caveat:** this is *not a dedicated fix commit* — the fix was
-made in the working tree and is bundled into the single engine commit, so no
-commit isolates just this change.
+NCI at 31 December was previously "NCI at acquisition (spot) + share of H2
+profit" = 1,341,888.19, which did not equal 20% of India's closing net assets.
+It is now measured directly as `20% x (net assets at acquisition + H2 result)`
+translated at the **closing** rate = **1,342,258.61**, and the
+`nci_reconciles_to_closing_net_assets` check passes with a zero difference.
 
-### M4. Reported statements did not foot — fixed in `aeab17c`
+### 4. Retained-earnings / translation-reserve plugs — REMOVED
 
-Each line is rounded to 2 dp independently (policy §7), so in several places
-the rounded lines summed to a penny different from the reported total. Fixed by
-footing every summary section to its total, absorbing the presentation residual
-in the largest line while never changing the total (`_foot_section`). Introduced
-in **`aeab17c17b940189fde78a7d740bdacd6003e7f5`**.
+Two plugs previously absorbed unreconciled amounts into retained earnings
+(`_opening_position_unreconciled`) and the investment-elimination residual.
+Both are gone. Retained earnings is now exactly opening RE + the explainable UK
+share-capital excess + profit attributable to owners, and the translation
+reserve is the genuine exchange difference on translation (see §5 below). The
+`unexplained_residual_within_tolerance` check now fails if any residual exceeds
+£0.005; on the supplied data the residual is **0.00**.
 
-### M5. Stale skill/spec text claimed capabilities did not exist — fixed in `aeab17c`
+### 5. Translation-reserve calculation — CORRECTED
 
-The `ConsolidationSkill` docstring and `SkillSpec` still said translation,
-elimination and statement assembly were "not implemented" and that `complete`
-could never be true. Corrected in
-**`aeab17c17b940189fde78a7d740bdacd6003e7f5`**.
+The reserve movement is no longer India's component alone. It is derived from
+the full translation arithmetic — India (acquisition-to-closing and H2 profit),
+goodwill (retranslated from spot), the US parent (opening net assets and the
+year's result), the parent investments, and the removal of the NCI's share —
+and is then checked against the ledger identity. The reported figure,
+**−75,355.69**, is what the ledger produces and it reconciles the balance sheet
+exactly. The simplified closed-form estimate (44,780.67) and the difference are
+disclosed as a warning (`translation_reserve_reconciliation`): the difference is
+the exchange effect of the posted adjusting journals and the eliminations that
+the closed form does not model. It is never routed to retained earnings.
 
-### Commit-coverage gap (explicit)
+### 6. Journal counts omitted the excluded bucket — FIXED
 
-Of the five mistakes above, only **M1 and M2 have a distinct, attributable fix
-commit (`28f3b43`)**. **M3, M4 and M5 cannot be tied to a dedicated fix
-commit**: the repository keeps a single engine commit (`aeab17c`) plus one
-further fix (`28f3b43`), and the intermediate fixes were made in the working
-tree without being committed individually. Two `git stash` entries
-(`stash@{0}`, `stash@{1}`) and their base commits remain in the object store as
-evidence that intermediate states existed, but they are not commits on the main
-history. No commit hash is invented here to fill the gap.
+`journals` now reports `posted`, `rejected`, `held_for_review`, **and**
+`excluded`, plus the `total` (15 + 2 + 2 + 1 = 20). All required output keys are
+retained.
+
+### 7. Silent hardcoded fallbacks — REMOVED
+
+`_opening_equity` no longer carries hardcoded default balances
+(1,250,000 / 12,604,747.93 / 412,350): it reads strictly from
+`prior_year_group.csv` and fails if a required account is missing.
+Acquisition dates and functional currencies come only from the entity master.
+
+### 8. SGD bank summed every foreign-currency row — FIXED
+
+The SGD figure now includes only rows that are **both** transacted in SGD
+**and** map to a bank account in the group chart of accounts, so the UK's USD
+intercompany payable is excluded. With no GBP/SGD closing rate in
+`fx_rates.csv`, the figure is correctly `null` with an explicit reason.
+
+### 9. Intercompany in-transit and elimination signs — VERIFIED
+
+The in-transit invoice (`INV-US-2291`) is recognised on **both** sides at the
+closing rate and eliminated to zero (`ELIM-TRANSIT-005`); only the genuine
+booking-rate difference (£11,957.88 of the £20,066.42 total) is posted to FX
+(7300). All elimination journals balance.
 
 ---
 

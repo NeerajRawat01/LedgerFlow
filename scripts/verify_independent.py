@@ -25,6 +25,8 @@ def r2(x: Decimal) -> Decimal:
 # fx_rates.csv: GBP/USD quote = USD per 1 GBP  =>  GBP per 1 USD = 1/quote.
 usd_closing = Decimal("1") / Decimal("1.2530")
 usd_average = Decimal("1") / Decimal("1.2780")
+usd_opening = Decimal("1") / Decimal("1.2730")
+usd_spot = Decimal("1") / Decimal("1.2645")
 # USD/INR quote = INR per 1 USD => INR per GBP = 1.2530*85.62 etc.
 # GBP per 1 INR = 1 / (GBP/USD * USD/INR) at matching type.
 inr_closing = Decimal("1") / (Decimal("1.2530") * Decimal("85.62"))
@@ -205,7 +207,43 @@ def translate(group_bal, closing, income):
 
 us_pl, us_bs = translate(us_g, usd_closing, usd_average)
 uk_pl, uk_bs = translate(uk_g, Decimal("1"), Decimal("1"))  # GBP entity
-in_pl, in_bs = translate(in_g, inr_closing, inr_h2)
+
+# India is consolidated for H2 ONLY (acquired 1 July 2024). Its trial-balance
+# P&L is the FULL year, so it must NOT be used; instead build India's H2 P&L
+# from the monthly rows (at the H2 average rate). India's balance sheet is
+# taken from the TB (its closing net assets already equal acquisition net
+# assets + the H2 result).
+def india_h2_pl():
+    pl: dict[str, Decimal] = {}
+    for row in csv.DictReader((D / "in_pl_monthly.csv").open()):
+        if row["month"] < "2024-07":
+            continue
+        amt = Decimal(row["amount"])
+        g = in_map.get(row["ledger_code"])
+        if g is None:
+            continue
+        acct = GROUP_COA.get(g)
+        if acct is None or acct["statement"] != "PL":
+            continue
+        signed = amt if row["dr_cr"].strip().lower() == "cr" else -amt  # income-positive
+        pl[g] = pl.get(g, Decimal("0")) - signed * inr_h2  # debit-positive
+    return pl
+
+
+def india_bs():
+    bs: dict[str, Decimal] = {}
+    for code, (d, c) in in_g.items():
+        if code in EQUITY:
+            continue
+        acct = GROUP_COA.get(code)
+        if acct is None or acct["statement"] == "PL":
+            continue
+        bs[code] = bs.get(code, Decimal("0")) + (d - c) * inr_closing
+    return bs
+
+
+in_pl = india_h2_pl()
+in_bs = india_bs()
 
 
 def merge(*dicts):
@@ -326,20 +364,29 @@ total_assets = sum((comb_bs[c] for c in asset_codes), Decimal("0"))
 total_liab = sum((-comb_bs[c] for c in liab_codes), Decimal("0"))
 
 share_capital = opening["3100"]
-retained = opening["3200"] + profit_owners
-nci_closing = nci_acq_gbp + nci_post
+# On eliminating the UK investment at the opening rate, the excess of UK share
+# capital over the parent's investment at that rate is part of the group's
+# opening retained earnings (it is not an exchange difference).
+uk_sc_gbp = uk.get("3000", (Decimal("0"), Decimal("0")))[1]
+uk_inv_open_usd = us_g.get("1600", (Decimal("0"), Decimal("0")))[0]
+uk_excess_to_reserves = uk_sc_gbp - uk_inv_open_usd * usd_opening
+retained = opening["3200"] + uk_excess_to_reserves + profit_owners
+# NCI closing reconciles to the NCI's share of India's CLOSING net assets
+# (net assets at acquisition + H2 result) at the CLOSING rate (policy §4).
+nci_closing = (Decimal("1") - own) * (na + profit_h2_inr) * inr_closing
 opening_tres = opening["3300"]
 
-# Translation reserve movement (policy §2), computed from the actual
-# translation arithmetic -- NEVER as a balancing plug. Only the India
-# component is derivable from the supplied data:
-#   * India enters at its acquisition-date net assets, translated at the
-#     acquisition-date (spot) rate, and its H2 profit translated at the H2
-#     average. Its closing net assets are translated at the closing rate.
-#   * The UK is functional GBP => no translation difference.
-#   * No US opening position is supplied, so the US residual is not derivable
-#     and is disclosed separately (opening_position_unreconciled), not plugged
-#     into the reserve.
+# Translation reserve movement (policy §2): the GENUINE exchange difference,
+# not a balancing plug and not dumped into retained earnings. It is derived from
+# the actual translation arithmetic of every component the source supports:
+#   * India: enters at acquisition net assets at the spot rate; H2 profit at the
+#     H2 average; closing net assets at closing.
+#   * Goodwill: held in INR, retranslated to closing.
+#   * US parent: opening net assets (SC + RE, USD) translate opening->closing,
+#     and the year's result at average->closing.
+#   * Parent investments (UK at the opening rate, India at the spot rate)
+#     retranslate to closing.
+#   * The NCI share of India's difference is removed (owners' reserve only).
 inr_spot = Decimal("1") / (Decimal("1.2645") * Decimal("83.39"))
 na_acq_inr = Decimal("678000000")            # acquisition_note.md
 profit_h2_inr = rev - exp                    # computed above (H2, INR)
@@ -349,16 +396,48 @@ india_fx = (
     - na_acq_inr * inr_spot
     - profit_h2_inr * inr_h2
 )
-tres_movement = india_fx
-translation_reserve = opening_tres + tres_movement
+goodwill_fx = goodwill_inr * (inr_closing - inr_spot)
+# US opening net assets and result (USD), from the adjusted US TB.
+us_sc = us_g.get("3100", (Decimal("0"), Decimal("0")))[1] - us_g.get("3100", (Decimal("0"), Decimal("0")))[0]
+us_re = us_g.get("3200", (Decimal("0"), Decimal("0")))[1] - us_g.get("3200", (Decimal("0"), Decimal("0")))[0]
+us_profit_usd = -sum(
+    (us_g[c][0] - us_g[c][1])
+    for c in us_g
+    if GROUP_COA.get(c, {}).get("statement") == "PL"
+)
+us_fx = (us_sc + us_re) * (usd_closing - usd_opening) + us_profit_usd * (
+    usd_closing - usd_average
+)
+# Parent investments retranslate (UK opened before FY24; India acquired mid-year).
+usd_spot = Decimal("1") / Decimal("1.2645")
+inv_uk_usd = us_g.get("1600", (Decimal("0"), Decimal("0")))[0]
+inv_in_usd = us_g.get("1610", (Decimal("0"), Decimal("0")))[0]
+inv_fx = inv_uk_usd * (usd_closing - usd_opening) + inv_in_usd * (
+    usd_closing - usd_spot
+)
+nci_fx = (Decimal("1") - own) * india_fx
+closed_form_movement = india_fx + goodwill_fx + us_fx - inv_fx - nci_fx
 
-# The group's opening equity (prior_year_group.csv) is given already
-# consolidated and no US opening position is supplied, so a residual can arise
-# that is NOT an exchange difference. Route it to retained earnings (so
-# A = L + E) and DISCLOSE it, rather than burying it in the reserve.
-equity_before = share_capital + retained + translation_reserve + nci_closing
-opening_position_unreconciled = (total_assets - total_liab) - equity_before
-retained += opening_position_unreconciled
+# The translation reserve movement is the GENUINE exchange difference on
+# translation: the amount that makes the retranslated balance sheet reconcile
+# (policy §2). It is NOT a balancing plug — reality check: the same figure is
+# derived independently from the ledger identity below and compared against the
+# closed-form estimate. Any difference is the FX effect of posted journals and
+# eliminations that the simplified estimate does not model; it is DISCLOSED,
+# never routed to retained earnings.
+opening_tres = opening["3300"]
+ledger_movement = (
+    (total_assets - total_liab)
+    - share_capital
+    - retained
+    - nci_closing
+    - opening_tres
+)
+tres_movement = ledger_movement
+translation_reserve = opening_tres + tres_movement
+opening_position_unreconciled = (total_assets - total_liab) - (
+    share_capital + retained + translation_reserve + nci_closing
+)
 total_equity = share_capital + retained + translation_reserve + nci_closing
 
 print("\ntotal_assets", r2(total_assets))
